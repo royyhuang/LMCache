@@ -31,6 +31,7 @@ REQUEST_NAMES = [
     "QUERY_PREFETCH_LOOKUP_HITS",
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
+    "MARSHAL",
 ]
 
 # Type alias for cache keys
@@ -141,6 +142,25 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "END_SESSION": ProtocolDefinition(
             payload_classes=[str],
             response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # KV tunneling — pack the unmarshalled KV for `real_prompt` into a
+        # header-prepended CPU blob and stash it under `marshal_handle` in
+        # the server's workspace dict. A subsequent RETRIEVE carrying the
+        # same `marshal_handle` scatters that blob into vLLM's paged cache.
+        # See design/kv-tunneling.md for the byte layout.
+        # Payload:
+        #   - marshal_handle: str - rendezvous key for the workspace entry
+        #   - real_prompt: list[int] - token IDs of the real prompt
+        #   - method_params: dict - method-specific params (num_sinks,
+        #       window_size, cache_salt); current impl hardcodes StreamingLLM
+        #   - worker_id: int - GPU instance ID whose KV cache holds the prompt
+        # Returns: tuple[bool, int, str] - (success, num_fake, error_message).
+        #   On success, error_message == "". num_fake is the number of fake
+        #   slots the marshalled blob occupies, 0 on failure.
+        "MARSHAL": ProtocolDefinition(
+            payload_classes=[str, list[int], dict, int],
+            response_class=tuple[bool, int, str],
             handler_type=HandlerType.BLOCKING,
         ),
     }

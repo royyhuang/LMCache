@@ -55,6 +55,7 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
 )
+from lmcache.v1.multiprocess.marshal_kernels import streaming_llm_pack
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -66,6 +67,13 @@ from lmcache.v1.multiprocess.token_hasher import TokenHasher
 import lmcache.c_ops as lmc_ops
 
 logger = init_logger(__name__)
+
+
+# Per-process workspace for KV-tunneled MARSHAL → RETRIEVE rendezvous.
+# MVP leaks entries (never deleted): acceptable at tens-of-requests scale
+# since each entry pins a ~hundreds-of-MB CPU tensor. Phase 4 follow-up
+# adds TTL eviction once the proxy is in production.
+_WORKSPACE: dict[str, MemoryObj] = {}
 
 
 # Helper functions
@@ -402,6 +410,8 @@ class MPCacheEngine:
         gpu_block_ids: list[int],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
+        *,
+        marshal_handle: str = "",
     ) -> tuple[bytes, bool]:
         """
         Retrieves the CPU KV cache and put into GPU blocks.
@@ -416,12 +426,25 @@ class MPCacheEngine:
                 the start of the retrieve range. This avoids overwriting
                 APC-shared GPU blocks that may be read concurrently by other
                 requests.
+            marshal_handle (str): Rendezvous key for a KV-tunneled request.
+                When non-empty and present in ``_WORKSPACE``, the packed
+                marshalled blob stashed there by a prior MARSHAL RPC is
+                scattered into ``gpu_block_ids`` instead of reading from
+                storage. Empty string (default) falls through to the
+                standard storage path.
 
         Returns:
             tuple[bytes, bool]: The first element is the IPC handle of the event
                 that signals the completion of the retrieve operation. The second
                 element indicates whether the key was successfully retrieved.
         """
+        if marshal_handle and marshal_handle in _WORKSPACE:
+            return self._retrieve_from_workspace(
+                marshal_handle=marshal_handle,
+                instance_id=instance_id,
+                gpu_block_ids=gpu_block_ids,
+            )
+
         session = self.session_manager.get_or_create(key.request_id)
         session.set_tokens(list(key.token_ids))
         chunk_hashes = [
@@ -576,6 +599,212 @@ class MPCacheEngine:
             ed - st,
         )
 
+        return event.ipc_handle(), True
+
+    # ------------------------------------------------------------------
+    # KV tunneling — MARSHAL RPC and the workspace-driven retrieve path.
+    # See design/kv-tunneling-impl.md §4.6 (on-the-fly marshalling) for
+    # the full flow; this file implements Phase 2 of the MVP.
+    # ------------------------------------------------------------------
+
+    def marshal(
+        self,
+        marshal_handle: str,
+        real_prompt: list[int],
+        method_params: dict,
+        worker_id: int,
+    ) -> tuple[bool, int, str]:
+        """Pack the unmarshalled KV for ``real_prompt`` into a workspace blob.
+
+        Runs the StreamingLLM selection kernel on CPU: fetches the stored
+        unmarshalled chunks for ``real_prompt``, copies the sink +
+        sliding-window slots into a fresh pinned-CPU tensor with a header
+        prepended, and parks the resulting MemoryObj in ``_WORKSPACE``
+        keyed by ``marshal_handle``. A later RETRIEVE carrying the same
+        ``marshal_handle`` scatters that blob into vLLM's paged cache.
+
+        Args:
+            marshal_handle: Rendezvous key used by the proxy to redeem the
+                workspace entry via RETRIEVE.
+            real_prompt: Token IDs of the real prompt whose KV is already
+                stored unmarshalled in LMCache (populated by a prior normal
+                completion — the miss path).
+            method_params: Method-specific parameters. For MVP we honor
+                only ``num_sinks`` (default 4), ``window_size`` (default
+                1020), and ``cache_salt`` (default empty). Other keys are
+                ignored; future methods will define their own schema.
+            worker_id: GPU instance ID whose stored KV to look up. Must
+                match a prior REGISTER_KV_CACHE call.
+
+        Returns:
+            tuple[bool, int, str]: ``(success, num_fake, error_message)``.
+            On success ``num_fake`` is the number of fake slots the packed
+            blob occupies and ``error_message`` is the empty string. On
+            failure ``num_fake`` is 0 and ``error_message`` describes why.
+        """
+        try:
+            num_sinks = int(method_params.get("num_sinks", 4))
+            window_size = int(method_params.get("window_size", 1020))
+            cache_salt = str(method_params.get("cache_salt", ""))
+
+            mem_objs = self._fetch_unmarshalled_for_marshal(
+                real_prompt=real_prompt,
+                worker_id=worker_id,
+                cache_salt=cache_salt,
+            )
+            packed, num_fake = streaming_llm_pack(
+                mem_objs=mem_objs,
+                chunk_size=self.chunk_size,
+                real_prompt_len=len(real_prompt),
+                num_sinks=num_sinks,
+                window_size=window_size,
+            )
+            # ref_count_up() is non-negotiable: without it the underlying
+            # allocator can reclaim the buffer while a concurrent RETRIEVE
+            # is mid-copy. MVP leaks entries (no matching ref_count_down);
+            # a production TTL eviction is a Phase-4 follow-up.
+            packed.ref_count_up()
+            _WORKSPACE[marshal_handle] = packed
+            logger.info(
+                "MARSHAL handle=%s real_tokens=%d num_fake=%d",
+                marshal_handle,
+                len(real_prompt),
+                num_fake,
+            )
+            return (True, num_fake, "")
+        except Exception as exc:  # noqa: BLE001 — surface error to client
+            logger.exception("MARSHAL failed for handle=%s", marshal_handle)
+            return (False, 0, str(exc))
+
+    def _fetch_unmarshalled_for_marshal(
+        self,
+        real_prompt: list[int],
+        worker_id: int,
+        cache_salt: str,
+    ) -> list[MemoryObj]:
+        """Fetch the unmarshalled KV chunks covering ``real_prompt``.
+
+        Uses the storage manager's prefetch-then-read pattern, same as the
+        normal retrieve path. The caller (``marshal``) reads the chunks'
+        raw_data *before* the storage locks are released — pack copies
+        bytes into a fresh tensor so lifetime is safe.
+
+        Args:
+            real_prompt: Token IDs of the real prompt.
+            worker_id: GPU instance ID whose stored KV to look up.
+            cache_salt: Per-user isolation salt matching the one used when
+                the chunks were originally stored. Empty string matches
+                unsalted entries.
+
+        Returns:
+            The ordered list of MemoryObj chunks covering ``real_prompt``.
+
+        Raises:
+            RuntimeError: If the worker is unknown, its layout desc is
+                missing, or any chunk is not resident in L1 storage.
+        """
+        if worker_id not in self.gpu_context_meta:
+            raise RuntimeError(
+                f"no GPU context registered for worker_id={worker_id}"
+            )
+        model_name, world_size = self.gpu_context_meta[worker_id]
+        layout_desc = self._find_layout_desc(model_name, world_size)
+        if layout_desc is None:
+            raise RuntimeError(
+                f"no layout desc for model={model_name} world_size={world_size}"
+            )
+
+        scratch_key = f"__marshal__{cache_salt}__{id(real_prompt)}"
+        session = self.session_manager.get_or_create(scratch_key)
+        session.set_tokens(list(real_prompt))
+        chunk_hashes = [
+            TokenHasher.hash_to_bytes(h)
+            for h in session.get_hashes(0, len(real_prompt))
+        ]
+        ipc_key = IPCCacheEngineKey(
+            model_name=model_name,
+            world_size=world_size,
+            worker_id=worker_id,
+            token_ids=tuple(real_prompt),
+            start=0,
+            end=len(real_prompt),
+            request_id=scratch_key,
+            cache_salt=cache_salt,
+        )
+        obj_keys = ipc_key_to_object_keys(ipc_key, chunk_hashes)
+
+        self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
+        with self.storage_manager.read_prefetched_results(obj_keys) as mem_objs:
+            if mem_objs is None:
+                raise RuntimeError("unmarshalled KV not fully cached in L1")
+            # streaming_llm_pack copies slot bytes into a fresh pinned-CPU
+            # tensor, so the chunks' read locks can safely release after
+            # this method returns. We return the list view — callers must
+            # complete reads before exiting the parent `with`-block.
+            return list(mem_objs)
+
+    def _retrieve_from_workspace(
+        self,
+        marshal_handle: str,
+        instance_id: int,
+        gpu_block_ids: list[int],
+    ) -> tuple[bytes, bool]:
+        """Scatter a workspace blob into vLLM's paged KV cache.
+
+        Mirrors the chunk-scatter loop in :meth:`retrieve` but operates on
+        a single MemoryObj (the marshalled blob) treated as one batched
+        chunk. Integration with a real GPU context is validated in Phase 6;
+        Phase 2 unit tests monkey-patch this method to assert the
+        workspace lookup fires without spinning up CUDA.
+
+        Args:
+            marshal_handle: Key into ``_WORKSPACE``; the caller guarantees
+                it is present.
+            instance_id: GPU instance ID; must have a registered context.
+            gpu_block_ids: Paged-cache block IDs that receive the blob.
+
+        Returns:
+            tuple[bytes, bool]: CUDA event IPC handle and success flag,
+            same shape as :meth:`retrieve`.
+        """
+        mem_obj = _WORKSPACE[marshal_handle]
+        if instance_id not in self.gpu_contexts:
+            raise RuntimeError(f"KV cache not registered for GPU ID {instance_id}")
+        gpu_context = self.gpu_contexts[instance_id]
+
+        with (
+            torch.cuda.device(gpu_context.device),
+            torch.cuda.stream(gpu_context.stream),
+        ):
+            all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
+            event = torch.cuda.Event(interprocess=True)
+            lmcache_memcpy_async_h2d(
+                mem_obj,
+                gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0),
+            )
+            num_groups = gpu_context.kv_layer_groups_manager.num_groups
+            for group_idx in range(num_groups):
+                tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
+                    1, group_idx
+                )
+                group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                lmc_ops.multi_layer_block_kv_transfer(
+                    group_kv_pointers,
+                    [tb.data_ptr() for tb in tmp_buffers],
+                    all_block_ids_gpu,
+                    gpu_context.device,
+                    lmc_ops.TransferDirection.H2D,
+                    gpu_context.get_shape_desc(group_idx),
+                    self.chunk_size,
+                    gpu_context.gpu_kv_format_,
+                    0,
+                )
+            event.record()
+        logger.info(
+            "RETRIEVE from workspace handle=%s blocks=%d",
+            marshal_handle,
+            len(gpu_block_ids),
+        )
         return event.ipc_handle(), True
 
     def _find_layout_desc(
@@ -1056,6 +1285,7 @@ def run_cache_server(
     )
     add_handler_helper(server, RequestType.FREE_LOOKUP_LOCKS, engine.free_lookup_locks)
     add_handler_helper(server, RequestType.RETRIEVE, engine.retrieve)
+    add_handler_helper(server, RequestType.MARSHAL, engine.marshal)
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
     add_handler_helper(server, RequestType.PING, engine.ping)
@@ -1082,6 +1312,7 @@ def run_cache_server(
             RequestType.CLEAR,
             RequestType.PING,
             RequestType.REPORT_BLOCK_ALLOCATION,
+            RequestType.MARSHAL,
         ],
         max_workers=mp_config.max_cpu_workers,
     )
