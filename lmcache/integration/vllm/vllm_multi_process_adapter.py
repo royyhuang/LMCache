@@ -200,6 +200,12 @@ class LoadStoreOp:
     """Number of tokens to skip writing at the beginning of the retrieve
     range. Used to avoid overwriting APC-shared GPU blocks during retrieve."""
 
+    # KV tunneling (Phase 3): rendezvous key for the LMCache workspace
+    # entry populated by a prior MARSHAL RPC. When non-None, the server
+    # reads WORKSPACE[marshal_handle] instead of doing token-hash lookup.
+    # The tunneled path bypasses token-hash matching entirely.
+    marshal_handle: str | None = None
+
     def __len__(self) -> int:
         return len(self.block_ids)
 
@@ -788,6 +794,11 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
+        # Phase 3: append marshal_handle as the trailing ZMQ payload item.
+        # Empty string when not tunneled; the server falls through to the
+        # stock storage-lookup path in that case. The RETRIEVE
+        # ProtocolDefinition was extended in lockstep (see protocols/
+        # engine.py).
         future = send_lmcache_request(
             self.mq_client,
             RequestType.RETRIEVE,
@@ -797,6 +808,7 @@ class LMCacheMPWorkerAdapter:
                 op.block_ids,
                 event.ipc_handle(),
                 op.skip_first_n_tokens,
+                op.marshal_handle or "",
             ],
         ).to_cuda_future()
         self.retrieve_futures[request_id] = (future, list(op.block_ids))

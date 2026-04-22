@@ -410,7 +410,6 @@ class MPCacheEngine:
         gpu_block_ids: list[int],
         event_ipc_handle: bytes,
         skip_first_n_tokens: int = 0,
-        *,
         marshal_handle: str = "",
     ) -> tuple[bytes, bool]:
         """

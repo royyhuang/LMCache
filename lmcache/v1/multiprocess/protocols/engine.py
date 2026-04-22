@@ -88,9 +88,12 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - event_ipc_handle: bytes - CUDA event IPC handle for synchronization
         #   - skip_first_n_tokens: int - Number of tokens to skip writing at the
         #     start of the retrieve range (to avoid overwriting APC-shared blocks)
+        #   - marshal_handle: str - KV tunneling rendezvous key. Non-empty means
+        #     the server reads WORKSPACE[marshal_handle] instead of doing the
+        #     token-hash lookup. Empty string is the stock (non-tunneled) path.
         # Returns: tuple[bytes, bool] - (CUDA event handle, success flag)
         "RETRIEVE": ProtocolDefinition(
-            payload_classes=[KeyType, int, list[int], bytes, int],
+            payload_classes=[KeyType, int, list[int], bytes, int, str],
             response_class=tuple[bytes, bool],
             handler_type=HandlerType.BLOCKING,
         ),
