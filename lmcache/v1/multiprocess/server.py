@@ -802,9 +802,7 @@ class MPCacheEngine:
                 missing, or any chunk is not resident in L1 storage.
         """
         if worker_id not in self.gpu_context_meta:
-            raise RuntimeError(
-                f"no GPU context registered for worker_id={worker_id}"
-            )
+            raise RuntimeError(f"no GPU context registered for worker_id={worker_id}")
         model_name, world_size = self.gpu_context_meta[worker_id]
         layout_desc = self._find_layout_desc(model_name, world_size)
         if layout_desc is None:
@@ -895,9 +893,7 @@ class MPCacheEngine:
             )
             num_groups = gpu_context.kv_layer_groups_manager.num_groups
             for group_idx in range(num_groups):
-                tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
-                    1, group_idx
-                )
+                tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(1, group_idx)
                 group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
                 lmc_ops.multi_layer_block_kv_transfer(
                     group_kv_pointers,

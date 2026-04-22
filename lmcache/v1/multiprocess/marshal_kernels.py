@@ -75,13 +75,13 @@ def _build_header_bytes(
         buf.extend(struct.pack("<i", p))
 
     # StreamingLLM metadata block (12 bytes).
-    buf.append(STREAMING_LLM_METHOD_ID)           # compression_type (byte 0)
-    buf.append(0)                                  # packed_dtype (byte 1, N/A for BF16)
-    buf.extend(struct.pack("<i", len(pos_ids)))   # num_real_tokens (bytes 2..5)
-    buf.extend(struct.pack("<H", 1))               # packing_ratio (bytes 6..7)
-    buf.append(0xFF)                               # head_mask (byte 8)
-    buf.append(num_active_heads & 0xFF)           # num_active_heads (byte 9)
-    buf.extend(struct.pack("<H", 0))               # reserved (bytes 10..11)
+    buf.append(STREAMING_LLM_METHOD_ID)  # compression_type (byte 0)
+    buf.append(0)  # packed_dtype (byte 1, N/A for BF16)
+    buf.extend(struct.pack("<i", len(pos_ids)))  # num_real_tokens (bytes 2..5)
+    buf.extend(struct.pack("<H", 1))  # packing_ratio (bytes 6..7)
+    buf.append(0xFF)  # head_mask (byte 8)
+    buf.append(num_active_heads & 0xFF)  # num_active_heads (byte 9)
+    buf.extend(struct.pack("<H", 0))  # reserved (bytes 10..11)
 
     return bytes(buf)
 
