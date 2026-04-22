@@ -5,6 +5,8 @@ from functools import partial
 from itertools import islice
 from typing import Generator
 import argparse
+import os
+import struct
 import threading
 import time
 
@@ -31,7 +33,12 @@ from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_h2d,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObj,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 from lmcache.v1.mp_observability.config import (
     ObservabilityConfig,
     add_observability_args,
@@ -70,10 +77,65 @@ logger = init_logger(__name__)
 
 
 # Per-process workspace for KV-tunneled MARSHAL → RETRIEVE rendezvous.
+# Keyed by marshal_handle; value is a per-TP-rank dict because each TP
+# worker retrieves its own KV shard (shards hash to different object keys
+# — see ipc_key_to_object_keys). For single-GPU deployments the inner
+# dict has one entry at rank 0.
 # MVP leaks entries (never deleted): acceptable at tens-of-requests scale
 # since each entry pins a ~hundreds-of-MB CPU tensor. Phase 4 follow-up
 # adds TTL eviction once the proxy is in production.
-_WORKSPACE: dict[str, MemoryObj] = {}
+_WORKSPACE: dict[str, dict[int, MemoryObj]] = {}
+
+
+def _stub_pack_for_plumbing(
+    *,
+    mem_objs: list[MemoryObj],
+    chunk_size: int,
+) -> tuple[MemoryObj, int]:
+    """Plumbing-validation shortcut (KVTUNNEL_STUB_MARSHAL=1).
+
+    Copies the first fetched chunk byte-for-byte into a fresh pinned-CPU
+    tensor, stamps the four-float32 magic signature at bytes [0..16), and
+    returns it wrapped as a MemoryObj. This bypasses streaming_llm_pack's
+    layout-aware selection (P10 in design/mvp-deferred-work.md is still
+    outstanding) but produces a blob that the existing scatter kernel can
+    consume — enough to prove MARSHAL → WORKSPACE → RETRIEVE → plugin
+    backend flows correctly.
+
+    num_fake is set to chunk_size: the scatter writes chunk_size tokens
+    worth of bytes into vLLM's paged cache, so the connector must reserve
+    that many slots (see env/partial_e2e_smoke.py).
+    """
+    if not mem_objs:
+        raise RuntimeError("stub pack received empty mem_objs list")
+    src = mem_objs[0].raw_data
+    out_tensor = torch.empty_like(src, pin_memory=True)
+    out_tensor.copy_(src)
+
+    # Stamp magic. Assume raw_data is a 1D uint8 tensor (real LMCache
+    # chunks are). Four float32 values = 16 bytes. Little-endian.
+    magic_bytes = bytearray()
+    for m in (float("inf"), float("-inf"), float("inf"), float("-inf")):
+        magic_bytes.extend(struct.pack("<f", m))
+    flat = out_tensor.view(torch.uint8).reshape(-1)
+    flat[: len(magic_bytes)] = torch.frombuffer(magic_bytes, dtype=torch.uint8)
+
+    metadata = MemoryObjMetadata(
+        shape=out_tensor.shape,
+        dtype=out_tensor.dtype,
+        address=out_tensor.data_ptr(),
+        phy_size=out_tensor.numel() * out_tensor.dtype.itemsize,
+        ref_count=0,
+        fmt=MemoryFormat.UNDEFINED,
+    )
+    return (
+        TensorMemoryObj(
+            raw_data=out_tensor,
+            metadata=metadata,
+            parent_allocator=None,
+        ),
+        chunk_size,
+    )
 
 
 # Helper functions
@@ -438,8 +500,12 @@ class MPCacheEngine:
                 element indicates whether the key was successfully retrieved.
         """
         if marshal_handle and marshal_handle in _WORKSPACE:
+            # TP rank comes from the incoming key — each TP worker's
+            # RETRIEVE carries its own worker_id, matching the per-rank
+            # workspace entry produced by marshal(). See _WORKSPACE docs.
             return self._retrieve_from_workspace(
                 marshal_handle=marshal_handle,
+                tp_rank=key.worker_id or 0,
                 instance_id=instance_id,
                 gpu_block_ids=gpu_block_ids,
             )
@@ -646,29 +712,55 @@ class MPCacheEngine:
             window_size = int(method_params.get("window_size", 1020))
             cache_salt = str(method_params.get("cache_salt", ""))
 
-            mem_objs = self._fetch_unmarshalled_for_marshal(
-                real_prompt=real_prompt,
-                worker_id=worker_id,
-                cache_salt=cache_salt,
-            )
-            packed, num_fake = streaming_llm_pack(
-                mem_objs=mem_objs,
-                chunk_size=self.chunk_size,
-                real_prompt_len=len(real_prompt),
-                num_sinks=num_sinks,
-                window_size=window_size,
-            )
-            # ref_count_up() is non-negotiable: without it the underlying
-            # allocator can reclaim the buffer while a concurrent RETRIEVE
-            # is mid-copy. MVP leaks entries (no matching ref_count_down);
-            # a production TTL eviction is a Phase-4 follow-up.
-            packed.ref_count_up()
-            _WORKSPACE[marshal_handle] = packed
+            if worker_id not in self.gpu_context_meta:
+                raise RuntimeError(
+                    f"no GPU context registered for worker_id={worker_id}"
+                )
+            _, world_size = self.gpu_context_meta[worker_id]
+            use_stub = os.environ.get("KVTUNNEL_STUB_MARSHAL") == "1"
+
+            # Pack one workspace blob per TP rank. Each TP worker's
+            # RETRIEVE later addresses its own blob via the worker_id
+            # field on its IPCCacheEngineKey — see retrieve() dispatch.
+            # For single-GPU world_size=1 this loop runs once.
+            per_rank: dict[int, MemoryObj] = {}
+            num_fake = 0
+            for tp_rank in range(world_size):
+                mem_objs = self._fetch_unmarshalled_for_marshal(
+                    real_prompt=real_prompt,
+                    worker_id=worker_id,
+                    tp_rank=tp_rank,
+                    cache_salt=cache_salt,
+                )
+                if use_stub:
+                    # Plumbing-validation mode (pre-Phase-5); see
+                    # _stub_pack_for_plumbing for semantics.
+                    packed, num_fake = _stub_pack_for_plumbing(
+                        mem_objs=mem_objs,
+                        chunk_size=self.chunk_size,
+                    )
+                else:
+                    packed, num_fake = streaming_llm_pack(
+                        mem_objs=mem_objs,
+                        chunk_size=self.chunk_size,
+                        real_prompt_len=len(real_prompt),
+                        num_sinks=num_sinks,
+                        window_size=window_size,
+                    )
+                # ref_count_up() is non-negotiable: without it the
+                # allocator can reclaim the buffer while a concurrent
+                # RETRIEVE is mid-copy. MVP leaks entries; a production
+                # TTL eviction is a Phase-4 follow-up.
+                packed.ref_count_up()
+                per_rank[tp_rank] = packed
+            _WORKSPACE[marshal_handle] = per_rank
             logger.info(
-                "MARSHAL handle=%s real_tokens=%d num_fake=%d",
+                "MARSHAL handle=%s real_tokens=%d num_fake=%d ranks=%d%s",
                 marshal_handle,
                 len(real_prompt),
                 num_fake,
+                world_size,
+                " (STUB)" if use_stub else "",
             )
             return (True, num_fake, "")
         except Exception as exc:  # noqa: BLE001 — surface error to client
@@ -679,9 +771,10 @@ class MPCacheEngine:
         self,
         real_prompt: list[int],
         worker_id: int,
+        tp_rank: int,
         cache_salt: str,
     ) -> list[MemoryObj]:
-        """Fetch the unmarshalled KV chunks covering ``real_prompt``.
+        """Fetch the unmarshalled KV chunks for one TP rank of ``real_prompt``.
 
         Uses the storage manager's prefetch-then-read pattern, same as the
         normal retrieve path. The caller (``marshal``) reads the chunks'
@@ -690,7 +783,13 @@ class MPCacheEngine:
 
         Args:
             real_prompt: Token IDs of the real prompt.
-            worker_id: GPU instance ID whose stored KV to look up.
+            worker_id: GPU instance ID whose stored KV to look up. Used
+                only to route through the correct registered context; not
+                part of the storage key.
+            tp_rank: Tensor-parallel rank whose KV shard we want. Hashes
+                into the object key via ``kv_rank`` — the adapter uses
+                this field on ``IPCCacheEngineKey`` for the same purpose
+                during STORE, so the keys must match.
             cache_salt: Per-user isolation salt matching the one used when
                 the chunks were originally stored. Empty string matches
                 unsalted entries.
@@ -713,17 +812,20 @@ class MPCacheEngine:
                 f"no layout desc for model={model_name} world_size={world_size}"
             )
 
-        scratch_key = f"__marshal__{cache_salt}__{id(real_prompt)}"
+        scratch_key = f"__marshal__{cache_salt}__{id(real_prompt)}__{tp_rank}"
         session = self.session_manager.get_or_create(scratch_key)
         session.set_tokens(list(real_prompt))
         chunk_hashes = [
             TokenHasher.hash_to_bytes(h)
             for h in session.get_hashes(0, len(real_prompt))
         ]
+        # IPCCacheEngineKey.worker_id is the TP rank, matching what the
+        # worker adapter used when STOREing this shard (see
+        # vllm_multi_process_adapter.py::_create_key).
         ipc_key = IPCCacheEngineKey(
             model_name=model_name,
             world_size=world_size,
-            worker_id=worker_id,
+            worker_id=tp_rank,
             token_ids=tuple(real_prompt),
             start=0,
             end=len(real_prompt),
@@ -745,6 +847,7 @@ class MPCacheEngine:
     def _retrieve_from_workspace(
         self,
         marshal_handle: str,
+        tp_rank: int,
         instance_id: int,
         gpu_block_ids: list[int],
     ) -> tuple[bytes, bool]:
@@ -759,6 +862,9 @@ class MPCacheEngine:
         Args:
             marshal_handle: Key into ``_WORKSPACE``; the caller guarantees
                 it is present.
+            tp_rank: Which per-rank blob to pick from the workspace entry.
+                Matches the ``worker_id`` on the incoming
+                ``IPCCacheEngineKey`` that STORE originally used.
             instance_id: GPU instance ID; must have a registered context.
             gpu_block_ids: Paged-cache block IDs that receive the blob.
 
@@ -766,7 +872,13 @@ class MPCacheEngine:
             tuple[bytes, bool]: CUDA event IPC handle and success flag,
             same shape as :meth:`retrieve`.
         """
-        mem_obj = _WORKSPACE[marshal_handle]
+        per_rank = _WORKSPACE[marshal_handle]
+        if tp_rank not in per_rank:
+            raise RuntimeError(
+                f"marshal_handle={marshal_handle} has no blob for tp_rank={tp_rank}; "
+                f"available ranks={sorted(per_rank.keys())}"
+            )
+        mem_obj = per_rank[tp_rank]
         if instance_id not in self.gpu_contexts:
             raise RuntimeError(f"KV cache not registered for GPU ID {instance_id}")
         gpu_context = self.gpu_contexts[instance_id]
