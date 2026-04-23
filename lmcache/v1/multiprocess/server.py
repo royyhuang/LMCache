@@ -6,7 +6,6 @@ from itertools import islice
 from typing import Generator
 import argparse
 import os
-import struct
 import threading
 import time
 
@@ -33,12 +32,7 @@ from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_h2d,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import (
-    MemoryFormat,
-    MemoryObj,
-    MemoryObjMetadata,
-    TensorMemoryObj,
-)
+from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.config import (
     ObservabilityConfig,
     add_observability_args,
@@ -62,7 +56,7 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
 )
-from lmcache.v1.multiprocess.marshal_kernels import streaming_llm_pack
+from kvtunnel.marshal.pack import stub_pack_for_plumbing, streaming_llm_pack
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -85,139 +79,6 @@ logger = init_logger(__name__)
 # since each entry pins a ~hundreds-of-MB CPU tensor. Phase 4 follow-up
 # adds TTL eviction once the proxy is in production.
 _WORKSPACE: dict[str, dict[int, MemoryObj]] = {}
-
-
-def _stub_pack_for_plumbing(
-    *,
-    mem_objs: list[MemoryObj],
-    chunk_size: int,
-    num_layers: int,
-) -> tuple[MemoryObj, int]:
-    """Plumbing-validation shortcut (KVTUNNEL_STUB_MARSHAL=1).
-
-    Copies the first fetched chunk byte-for-byte into a fresh pinned-CPU
-    tensor, stamps a minimal VALID tunneling header (magic + fixed int32
-    fields + 1-entry pos_ids + 12-byte metadata) at the start of EACH
-    layer's byte range within the blob, and returns it as a MemoryObj.
-    This bypasses streaming_llm_pack's layout-aware selection (C1 in
-    plan/mvp-deferred-work.md is still outstanding) but produces a
-    blob that the plugin-backend's de-marshaler can parse end-to-end
-    on every decoder layer — enough to fire the R_delta tunnel path
-    and prove MARSHAL → WORKSPACE → RETRIEVE → plugin backend → R_delta
-    → attention flows correctly at every layer (vs only layer 0 in an
-    earlier single-stamp version).
-
-    Header layout chosen to produce realistic proportions (1 header
-    slot + chunk_size-1 data slots), NOT the degenerate 255/1 split
-    an earlier version used:
-
-    - ``pos_id_len = chunk_size - 1``
-    - ``pos_ids = [1, 2, …, chunk_size - 1]``
-    - ``num_fake_marshalled = chunk_size``
-    - ``num_header_slots = num_fake_marshalled - pos_id_len = 1``
-    - ``delta = pos_ids[-1] + 1 - num_fake_marshalled =
-      (chunk_size-1) + 1 - chunk_size = 0``
-
-    A zero delta means R_delta is a no-op rotation, so attention output
-    is identical to what a null-transform would produce (stub mode's
-    random KV data already guarantees garbage output anyway). The
-    backend's header-slot zero-out operates on exactly 1 slot (slot 0),
-    which was already corrupted by the header stamp — so zeroing is
-    lossless. Matches the layout a real streaming_llm_pack would emit
-    for Qwen3-8B geometry (slot_bytes=4096, header ~1060 bytes → 1 slot).
-
-    The blob layout assumed by this stamping is **layer-major**: the
-    scatter kernel ``multi_layer_block_kv_transfer`` treats the blob as
-    N contiguous per-layer byte ranges of equal size, in decoder-layer
-    order. ``total_bytes % num_layers == 0`` is asserted. Each layer's
-    first ``len(header)`` bytes are overwritten with the header so the
-    backend's magic-scan on every layer's paged cache will hit.
-
-    num_fake is set to chunk_size: the scatter writes chunk_size tokens
-    worth of bytes into vLLM's paged cache, so the connector must reserve
-    that many slots (see tests/smoke/partial_e2e_smoke.py).
-    """
-    if not mem_objs:
-        raise RuntimeError("stub pack received empty mem_objs list")
-    if num_layers <= 0:
-        raise RuntimeError(f"stub pack received num_layers={num_layers}")
-    src = mem_objs[0].raw_data
-    out_tensor = torch.empty_like(src, pin_memory=True)
-    out_tensor.copy_(src)
-
-    # Build a minimal valid tunneling header. Byte layout must match
-    # kvtunnel.attn_backend.impl._parse_header (and design/kv-tunneling.md
-    # §Fixed Header Layout). All fields little-endian.
-    #   bytes  0..15          — magic (4 × float32)
-    #   bytes 16..19          — pos_id_len (int32)
-    #   bytes 20..23          — metadata_len (int32)
-    #   bytes 24..27          — num_fake_marshalled (int32)
-    #   bytes 28..28+N*4      — pos_ids[0..N-1] (int32 each, N = chunk_size - 1)
-    #   bytes …..+12          — 12-byte metadata placeholder (zeros)
-    pos_id_len = chunk_size - 1
-    header = bytearray()
-    for m in (float("inf"), float("-inf"), float("inf"), float("-inf")):
-        header.extend(struct.pack("<f", m))
-    header.extend(struct.pack("<i", pos_id_len))
-    header.extend(struct.pack("<i", 12))  # metadata_len
-    header.extend(struct.pack("<i", chunk_size))  # num_fake_marshalled
-    for i in range(1, chunk_size):  # pos_ids = [1, 2, …, chunk_size-1]
-        header.extend(struct.pack("<i", i))
-    header.extend(b"\x00" * 12)  # metadata placeholder (all-zero)
-
-    flat = out_tensor.view(torch.uint8).reshape(-1)
-    total_bytes = flat.numel()
-    # LMCache's blob layout for Qwen3-style GQA models is K-first:
-    # [K_layer_0, K_layer_1, …, K_layer_{N-1}, V_layer_0, …, V_layer_{N-1}].
-    # Each K_i and V_i is a half-layer = chunk_size × num_kv_heads ×
-    # head_size × dtype_bytes. To put magic at every layer's
-    # block-0 slot-0 K-half (which is what the backend's probe scans),
-    # we need to stamp at the start of each K_i. With 2N equal
-    # half-regions in the blob, stride = total_bytes / (2 × num_layers).
-    # The first N stamps (i=0..N-1) land at K_i starts; the last N
-    # stamps (i=N..2N-1) land at V_i starts — harmless to the backend
-    # probe (which only scans K-halves) but ensures correctness if
-    # the layout ever flips to V-first.
-    num_stamp_regions = 2 * num_layers
-    if total_bytes % num_stamp_regions != 0:
-        raise RuntimeError(
-            f"stub pack: blob size {total_bytes} not divisible by "
-            f"2 × num_layers = {num_stamp_regions}; assumed K/V-split "
-            f"layer-major layout is broken"
-        )
-    region_bytes = total_bytes // num_stamp_regions
-    if region_bytes < len(header):
-        raise RuntimeError(
-            f"stub pack: per-K-or-V-region {region_bytes} bytes is "
-            f"smaller than header {len(header)} bytes; can't stamp"
-        )
-    # Stamp the header at every K-half start AND every V-half start.
-    # Before this fix: only layer 0 saw the magic — smoke surfaced
-    # empirical detection at every other layer after a first naive
-    # per-layer stamp, which revealed K-first layout. Now every
-    # decoder layer's paged cache K-half receives magic at its first
-    # slot so the backend's R_delta path fires on all layers.
-    header_tensor = torch.frombuffer(header, dtype=torch.uint8)
-    for region_idx in range(num_stamp_regions):
-        start = region_idx * region_bytes
-        flat[start : start + len(header)] = header_tensor
-
-    metadata = MemoryObjMetadata(
-        shape=out_tensor.shape,
-        dtype=out_tensor.dtype,
-        address=out_tensor.data_ptr(),
-        phy_size=out_tensor.numel() * out_tensor.dtype.itemsize,
-        ref_count=0,
-        fmt=MemoryFormat.UNDEFINED,
-    )
-    return (
-        TensorMemoryObj(
-            raw_data=out_tensor,
-            metadata=metadata,
-            parent_allocator=None,
-        ),
-        chunk_size,
-    )
 
 
 # Helper functions
@@ -816,12 +677,12 @@ class MPCacheEngine:
                 )
                 if use_stub:
                     # Plumbing-validation mode (pre-Phase-5); see
-                    # _stub_pack_for_plumbing for semantics. num_layers
+                    # stub_pack_for_plumbing for semantics. num_layers
                     # comes from the registered GPU context — needed so
                     # the stub stamps the magic header at every layer's
                     # byte-range start, not just layer 0's.
                     gpu_ctx = self.gpu_contexts[worker_id]
-                    packed, num_fake = _stub_pack_for_plumbing(
+                    packed, num_fake = stub_pack_for_plumbing(
                         mem_objs=mem_objs,
                         chunk_size=self.chunk_size,
                         num_layers=gpu_ctx.num_layers,
