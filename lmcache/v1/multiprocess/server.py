@@ -95,16 +95,37 @@ def _stub_pack_for_plumbing(
     """Plumbing-validation shortcut (KVTUNNEL_STUB_MARSHAL=1).
 
     Copies the first fetched chunk byte-for-byte into a fresh pinned-CPU
-    tensor, stamps the four-float32 magic signature at bytes [0..16), and
-    returns it wrapped as a MemoryObj. This bypasses streaming_llm_pack's
-    layout-aware selection (P10 in design/mvp-deferred-work.md is still
-    outstanding) but produces a blob that the existing scatter kernel can
-    consume — enough to prove MARSHAL → WORKSPACE → RETRIEVE → plugin
-    backend flows correctly.
+    tensor, stamps a minimal VALID tunneling header (magic + fixed int32
+    fields + 1-entry pos_ids + 12-byte metadata), and returns it as a
+    MemoryObj. This bypasses streaming_llm_pack's layout-aware selection
+    (P10 in design/mvp-deferred-work.md is still outstanding) but
+    produces a blob that the plugin-backend's de-marshaler can parse
+    end-to-end — enough to fire the R_delta tunnel path and prove
+    MARSHAL → WORKSPACE → RETRIEVE → plugin backend → R_delta → attention
+    flows correctly.
+
+    Header layout chosen to produce realistic proportions (1 header
+    slot + chunk_size-1 data slots), NOT the degenerate 255/1 split
+    an earlier version used:
+
+    - ``pos_id_len = chunk_size - 1``
+    - ``pos_ids = [1, 2, …, chunk_size - 1]``
+    - ``num_fake_marshalled = chunk_size``
+    - ``num_header_slots = num_fake_marshalled - pos_id_len = 1``
+    - ``delta = pos_ids[-1] + 1 - num_fake_marshalled =
+      (chunk_size-1) + 1 - chunk_size = 0``
+
+    A zero delta means R_delta is a no-op rotation, so attention output
+    is identical to what a null-transform would produce (stub mode's
+    random KV data already guarantees garbage output anyway). The
+    backend's header-slot zero-out operates on exactly 1 slot (slot 0),
+    which was already corrupted by the header stamp — so zeroing is
+    lossless. Matches the layout a real streaming_llm_pack would emit
+    for Qwen3-8B geometry (slot_bytes=4096, header ~1060 bytes → 1 slot).
 
     num_fake is set to chunk_size: the scatter writes chunk_size tokens
     worth of bytes into vLLM's paged cache, so the connector must reserve
-    that many slots (see env/partial_e2e_smoke.py).
+    that many slots (see tests/smoke/partial_e2e_smoke.py).
     """
     if not mem_objs:
         raise RuntimeError("stub pack received empty mem_objs list")
@@ -112,13 +133,27 @@ def _stub_pack_for_plumbing(
     out_tensor = torch.empty_like(src, pin_memory=True)
     out_tensor.copy_(src)
 
-    # Stamp magic. Assume raw_data is a 1D uint8 tensor (real LMCache
-    # chunks are). Four float32 values = 16 bytes. Little-endian.
-    magic_bytes = bytearray()
+    # Build a minimal valid tunneling header. Byte layout must match
+    # kvtunnel.attn_backend.impl._parse_header (and design/kv-tunneling.md
+    # §Fixed Header Layout). All fields little-endian.
+    #   bytes  0..15          — magic (4 × float32)
+    #   bytes 16..19          — pos_id_len (int32)
+    #   bytes 20..23          — metadata_len (int32)
+    #   bytes 24..27          — num_fake_marshalled (int32)
+    #   bytes 28..28+N*4      — pos_ids[0..N-1] (int32 each, N = chunk_size - 1)
+    #   bytes …..+12          — 12-byte metadata placeholder (zeros)
+    pos_id_len = chunk_size - 1
+    header = bytearray()
     for m in (float("inf"), float("-inf"), float("inf"), float("-inf")):
-        magic_bytes.extend(struct.pack("<f", m))
+        header.extend(struct.pack("<f", m))
+    header.extend(struct.pack("<i", pos_id_len))
+    header.extend(struct.pack("<i", 12))  # metadata_len
+    header.extend(struct.pack("<i", chunk_size))  # num_fake_marshalled
+    for i in range(1, chunk_size):  # pos_ids = [1, 2, …, chunk_size-1]
+        header.extend(struct.pack("<i", i))
+    header.extend(b"\x00" * 12)  # metadata placeholder (all-zero)
     flat = out_tensor.view(torch.uint8).reshape(-1)
-    flat[: len(magic_bytes)] = torch.frombuffer(magic_bytes, dtype=torch.uint8)
+    flat[: len(header)] = torch.frombuffer(header, dtype=torch.uint8)
 
     metadata = MemoryObjMetadata(
         shape=out_tensor.shape,
