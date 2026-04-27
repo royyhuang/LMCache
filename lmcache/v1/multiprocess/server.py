@@ -9,6 +9,8 @@ import os
 import threading
 import time
 
+from kvtunnel.marshal.pack import streaming_llm_pack, stub_pack_for_plumbing
+
 # Third Party
 import torch
 import zmq
@@ -56,7 +58,6 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
 )
-from kvtunnel.marshal.pack import stub_pack_for_plumbing, streaming_llm_pack
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocol import (
     RequestType,
@@ -688,12 +689,46 @@ class MPCacheEngine:
                         num_layers=gpu_ctx.num_layers,
                     )
                 else:
+                    # Real pack (C1): consume the GPU context's per-rank
+                    # head geometry so the pack can validate the chunk's
+                    # KV_2LTD shape and write the header's num_active_heads
+                    # field. Single group at MVP scale (no cross-layer-group
+                    # models yet); index 0.
+                    gpu_ctx = self.gpu_contexts[worker_id]
+                    logger.info(
+                        "[kvtunnel C1] real-pack tp_rank=%d real_prompt_len=%d "
+                        "chunk_size=%d block_size=%d num_sinks=%d window_size=%d "
+                        "num_layers=%d num_kv_heads=%d head_size=%d",
+                        tp_rank,
+                        len(real_prompt),
+                        self.chunk_size,
+                        gpu_ctx.block_size,
+                        num_sinks,
+                        window_size,
+                        gpu_ctx.num_layers,
+                        gpu_ctx.group_num_heads[0],
+                        gpu_ctx.group_head_sizes[0],
+                    )
                     packed, num_fake = streaming_llm_pack(
                         mem_objs=mem_objs,
                         chunk_size=self.chunk_size,
                         real_prompt_len=len(real_prompt),
                         num_sinks=num_sinks,
                         window_size=window_size,
+                        num_layers=gpu_ctx.num_layers,
+                        num_kv_heads=gpu_ctx.group_num_heads[0],
+                        head_size=gpu_ctx.group_head_sizes[0],
+                        block_size=gpu_ctx.block_size,
+                    )
+                    logger.info(
+                        "[kvtunnel C1] real-pack returned tp_rank=%d "
+                        "num_fake=%d blob_logical_shape=%s blob_dtype=%s "
+                        "blob_nbytes=%d",
+                        tp_rank,
+                        num_fake,
+                        tuple(packed.meta.shape),
+                        packed.raw_data.dtype,
+                        packed.get_size(),
                     )
                 # ref_count_up() is non-negotiable: without it the
                 # allocator can reclaim the buffer while a concurrent
@@ -760,35 +795,43 @@ class MPCacheEngine:
 
         scratch_key = f"__marshal__{cache_salt}__{id(real_prompt)}__{tp_rank}"
         session = self.session_manager.get_or_create(scratch_key)
-        session.set_tokens(list(real_prompt))
-        chunk_hashes = [
-            TokenHasher.hash_to_bytes(h)
-            for h in session.get_hashes(0, len(real_prompt))
-        ]
-        # IPCCacheEngineKey.worker_id is the TP rank, matching what the
-        # worker adapter used when STOREing this shard (see
-        # vllm_multi_process_adapter.py::_create_key).
-        ipc_key = IPCCacheEngineKey(
-            model_name=model_name,
-            world_size=world_size,
-            worker_id=tp_rank,
-            token_ids=tuple(real_prompt),
-            start=0,
-            end=len(real_prompt),
-            request_id=scratch_key,
-            cache_salt=cache_salt,
-        )
-        obj_keys = ipc_key_to_object_keys(ipc_key, chunk_hashes)
+        try:
+            session.set_tokens(list(real_prompt))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h)
+                for h in session.get_hashes(0, len(real_prompt))
+            ]
+            # IPCCacheEngineKey.worker_id is the TP rank, matching what the
+            # worker adapter used when STOREing this shard (see
+            # vllm_multi_process_adapter.py::_create_key).
+            ipc_key = IPCCacheEngineKey(
+                model_name=model_name,
+                world_size=world_size,
+                worker_id=tp_rank,
+                token_ids=tuple(real_prompt),
+                start=0,
+                end=len(real_prompt),
+                request_id=scratch_key,
+                cache_salt=cache_salt,
+            )
+            obj_keys = ipc_key_to_object_keys(ipc_key, chunk_hashes)
 
-        self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
-        with self.storage_manager.read_prefetched_results(obj_keys) as mem_objs:
-            if mem_objs is None:
-                raise RuntimeError("unmarshalled KV not fully cached in L1")
-            # streaming_llm_pack copies slot bytes into a fresh pinned-CPU
-            # tensor, so the chunks' read locks can safely release after
-            # this method returns. We return the list view — callers must
-            # complete reads before exiting the parent `with`-block.
-            return list(mem_objs)
+            self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
+            with self.storage_manager.read_prefetched_results(obj_keys) as mem_objs:
+                if mem_objs is None:
+                    raise RuntimeError("unmarshalled KV not fully cached in L1")
+                # streaming_llm_pack copies slot bytes into a fresh pinned-CPU
+                # tensor, so the chunks' read locks can safely release after
+                # this method returns. We return the list view — callers must
+                # complete reads before exiting the parent `with`-block.
+                return list(mem_objs)
+        finally:
+            # Scratch session is single-use: each MARSHAL gets a fresh
+            # key (id(real_prompt) is ephemeral). Without this the
+            # SessionManager dict grows unbounded until the 10-minute
+            # TTL sweep — tracked as a sharp edge in
+            # plan/real-streaming-llm-pack/design.md §6.4.
+            self.session_manager.remove(scratch_key)
 
     def _retrieve_from_workspace(
         self,
@@ -828,39 +871,140 @@ class MPCacheEngine:
         if instance_id not in self.gpu_contexts:
             raise RuntimeError(f"KV cache not registered for GPU ID {instance_id}")
         gpu_context = self.gpu_contexts[instance_id]
-
-        with (
-            torch.cuda.device(gpu_context.device),
-            torch.cuda.stream(gpu_context.stream),
-        ):
-            all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
-            event = torch.cuda.Event(interprocess=True)
-            lmcache_memcpy_async_h2d(
-                mem_obj,
-                gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0),
-            )
-            num_groups = gpu_context.kv_layer_groups_manager.num_groups
-            for group_idx in range(num_groups):
-                tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(1, group_idx)
-                group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
-                lmc_ops.multi_layer_block_kv_transfer(
-                    group_kv_pointers,
-                    [tb.data_ptr() for tb in tmp_buffers],
-                    all_block_ids_gpu,
-                    gpu_context.device,
-                    lmc_ops.TransferDirection.H2D,
-                    gpu_context.get_shape_desc(group_idx),
-                    self.chunk_size,
-                    gpu_context.gpu_kv_format_,
-                    0,
-                )
-            event.record()
+        # Debug print for C1 diagnosis: scatter asserts
+        # num_blocks_per_object × block_size == lmcache_chunk_size at
+        # mp_mem_kernels.cu:271-274. If gpu_block_ids count doesn't match
+        # chunk_size/block_size, scatter raises and mq.py:418 swallows
+        # the error → vLLM hangs. Surface it here.
         logger.info(
-            "RETRIEVE from workspace handle=%s blocks=%d",
+            "[kvtunnel C1] retrieve_from_workspace handle=%s tp_rank=%d "
+            "instance_id=%d gpu_block_ids_count=%d "
+            "blob_shape=%s blob_dtype=%s blob_nbytes=%d",
+            marshal_handle,
+            tp_rank,
+            instance_id,
+            len(gpu_block_ids),
+            tuple(mem_obj.raw_data.shape),
+            mem_obj.raw_data.dtype,
+            mem_obj.get_size(),
+        )
+
+        # KV-tunnel real pack emits a blob whose token-axis size is
+        # padded_num_fake (block-size aligned, ≤ chunk_size), not the
+        # full LMCache chunk_size. The scatter kernel takes the token-
+        # axis stride as a runtime argument (`chunk_size_arg`), so we
+        # read the per-blob value from mem_obj.metadata.shape[2] and
+        # pass it instead of self.chunk_size. For stub-mode blobs
+        # (which always span a full chunk) and unrelated paths,
+        # mem_obj.metadata.shape[2] == self.chunk_size, so behavior is
+        # unchanged.
+        blob_shape = tuple(mem_obj.meta.shape)
+        scatter_chunk_tokens = (
+            blob_shape[2]
+            if len(blob_shape) >= 3 and blob_shape[2] <= self.chunk_size
+            else self.chunk_size
+        )
+        # Pre-launch sanity log: surface the kernel's invariant
+        # (num_blocks_per_object × block_size == lmcache_chunk_size_arg,
+        # mp_mem_kernels.cu:271-274) BEFORE the launch, so a TORCH_CHECK
+        # failure is preceded by visible state in the MP log. Without
+        # this, the only artifact of a failure was the swallowed
+        # traceback at mq.py:418-433 ("Error in blocking handler") with
+        # no link back to scatter geometry.
+        bs = gpu_context.block_size
+        invariant_ok = len(gpu_block_ids) * bs == scatter_chunk_tokens
+        logger.info(
+            "[kvtunnel C1] scatter geometry handle=%s tp_rank=%d "
+            "scatter_chunk_tokens=%d blob_shape=%s self.chunk_size=%d "
+            "num_blocks=%d block_size=%d invariant(num_blocks*bs==tokens)=%s",
+            marshal_handle,
+            tp_rank,
+            scatter_chunk_tokens,
+            blob_shape,
+            self.chunk_size,
+            len(gpu_block_ids),
+            bs,
+            invariant_ok,
+        )
+        try:
+            with (
+                torch.cuda.device(gpu_context.device),
+                torch.cuda.stream(gpu_context.stream),
+            ):
+                all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
+                event = torch.cuda.Event(interprocess=True)
+                # h2d wrapper requires `gpu_buffer.nbytes == mem_obj.get_size()`.
+                # Slice the staging buffer to the blob's actual byte count
+                # so smaller blobs (real-pack with padded_num_fake <
+                # chunk_size) copy correctly.
+                mem_obj_size = mem_obj.get_size()
+                staging_buf = gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0)[
+                    :mem_obj_size
+                ]
+                logger.info(
+                    "[kvtunnel C1] h2d ENTER handle=%s mem_obj_size=%d "
+                    "staging_nbytes=%d",
+                    marshal_handle,
+                    mem_obj_size,
+                    staging_buf.nbytes,
+                )
+                lmcache_memcpy_async_h2d(mem_obj, staging_buf)
+                logger.info("[kvtunnel C1] h2d EXIT (launch returned)")
+                num_groups = gpu_context.kv_layer_groups_manager.num_groups
+                for group_idx in range(num_groups):
+                    tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
+                        1, group_idx
+                    )
+                    group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                    logger.info(
+                        "[kvtunnel C1] scatter ENTER group=%d/%d num_kv_pointers=%d "
+                        "num_tmp_buffers=%d",
+                        group_idx,
+                        num_groups,
+                        len(group_kv_pointers),
+                        len(tmp_buffers),
+                    )
+                    lmc_ops.multi_layer_block_kv_transfer(
+                        group_kv_pointers,
+                        [tb.data_ptr() for tb in tmp_buffers],
+                        all_block_ids_gpu,
+                        gpu_context.device,
+                        lmc_ops.TransferDirection.H2D,
+                        gpu_context.get_shape_desc(group_idx),
+                        scatter_chunk_tokens,
+                        gpu_context.gpu_kv_format_,
+                        0,
+                    )
+                    logger.info(
+                        "[kvtunnel C1] scatter EXIT group=%d (launch returned)",
+                        group_idx,
+                    )
+                event.record()
+                logger.info("[kvtunnel C1] event.record() returned")
+        except Exception:
+            # Surface the exception explicitly in the MP log before it
+            # propagates to mq._notify_response (which will swallow the
+            # response without sending it to vLLM, hanging the client).
+            # mq.py:433 also logs.exception, but having a kvtunnel-tagged
+            # line lets us grep for the failure directly.
+            logger.exception(
+                "[kvtunnel C1] retrieve_from_workspace raised handle=%s "
+                "tp_rank=%d scatter_chunk_tokens=%d num_blocks=%d block_size=%d",
+                marshal_handle,
+                tp_rank,
+                scatter_chunk_tokens,
+                len(gpu_block_ids),
+                bs,
+            )
+            raise
+        logger.info("[kvtunnel C1] obtaining ipc_handle handle=%s", marshal_handle)
+        ipc_bytes = event.ipc_handle()
+        logger.info(
+            "RETRIEVE from workspace handle=%s blocks=%d (returning ipc_handle, success)",
             marshal_handle,
             len(gpu_block_ids),
         )
-        return event.ipc_handle(), True
+        return ipc_bytes, True
 
     def _find_layout_desc(
         self,

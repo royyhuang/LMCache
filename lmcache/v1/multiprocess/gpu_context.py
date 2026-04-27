@@ -263,6 +263,17 @@ class GPUCacheContext:
         """Returns the hidden dimension sizes for each KV layer group."""
         return self.hidden_dim_sizes_
 
+    @property
+    def group_num_heads(self) -> list[int]:
+        """Returns the per-KV-layer-group KV-head counts (TP-rank-local
+        for non-MLA)."""
+        return self.group_num_heads_
+
+    @property
+    def group_head_sizes(self) -> list[int]:
+        """Returns the per-KV-layer-group head dimension sizes."""
+        return self.group_head_sizes_
+
     def get_shape_desc(self, group_idx: int) -> "lmc_ops.PageBufferShapeDesc":
         """Returns the PageBufferShapeDesc for the given KV layer group."""
         return self.shape_descs_[group_idx]
