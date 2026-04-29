@@ -79,7 +79,7 @@ logger = init_logger(__name__)
 # MVP leaks entries (never deleted): acceptable at tens-of-requests scale
 # since each entry pins a ~hundreds-of-MB CPU tensor. Phase 4 follow-up
 # adds TTL eviction once the proxy is in production.
-_WORKSPACE: dict[str, dict[int, MemoryObj]] = {}
+_WORKSPACE: dict[str, dict[int, list[MemoryObj]]] = {}
 
 
 # Helper functions
@@ -667,7 +667,7 @@ class MPCacheEngine:
             # RETRIEVE later addresses its own blob via the worker_id
             # field on its IPCCacheEngineKey — see retrieve() dispatch.
             # For single-GPU world_size=1 this loop runs once.
-            per_rank: dict[int, MemoryObj] = {}
+            per_rank: dict[int, list[MemoryObj]] = {}
             num_fake = 0
             for tp_rank in range(world_size):
                 mem_objs = self._fetch_unmarshalled_for_marshal(
@@ -683,22 +683,28 @@ class MPCacheEngine:
                     # the stub stamps the magic header at every layer's
                     # byte-range start, not just layer 0's.
                     gpu_ctx = self.gpu_contexts[worker_id]
-                    packed, num_fake = stub_pack_for_plumbing(
+                    packed_list, num_fake = stub_pack_for_plumbing(
                         mem_objs=mem_objs,
                         chunk_size=self.chunk_size,
                         num_layers=gpu_ctx.num_layers,
                     )
                 else:
-                    # Real pack (C1): consume the GPU context's per-rank
-                    # head geometry so the pack can validate the chunk's
+                    # Real pack: consume the GPU context's per-rank head
+                    # geometry so the pack can validate the chunk's
                     # KV_2LTD shape and write the header's num_active_heads
-                    # field. Single group at MVP scale (no cross-layer-group
-                    # models yet); index 0.
+                    # field. Multi-chunk-pack (Case B) emits a list of k
+                    # chunk-sized MemoryObjs; the retrieve path scatters
+                    # them via batched_iteration.
                     gpu_ctx = self.gpu_contexts[worker_id]
+                    # max_chunks default per plan/multi-chunk-pack §4.5:
+                    # 2× max_batch_size gives headroom past the kernel's
+                    # 4-chunk-per-call cap (mp_mem_kernels.cu:262-263).
+                    max_chunks = max(8, gpu_ctx.max_batch_size * 2)
                     logger.info(
-                        "[kvtunnel C1] real-pack tp_rank=%d real_prompt_len=%d "
+                        "[kvtunnel CB] real-pack tp_rank=%d real_prompt_len=%d "
                         "chunk_size=%d block_size=%d num_sinks=%d window_size=%d "
-                        "num_layers=%d num_kv_heads=%d head_size=%d",
+                        "num_layers=%d num_kv_heads=%d head_size=%d "
+                        "max_chunks=%d num_groups=%d is_mla=%s",
                         tp_rank,
                         len(real_prompt),
                         self.chunk_size,
@@ -708,8 +714,11 @@ class MPCacheEngine:
                         gpu_ctx.num_layers,
                         gpu_ctx.group_num_heads[0],
                         gpu_ctx.group_head_sizes[0],
+                        max_chunks,
+                        gpu_ctx.kv_layer_groups_manager.num_groups,
+                        gpu_ctx.is_mla,
                     )
-                    packed, num_fake = streaming_llm_pack(
+                    packed_list, num_fake = streaming_llm_pack(
                         mem_objs=mem_objs,
                         chunk_size=self.chunk_size,
                         real_prompt_len=len(real_prompt),
@@ -719,23 +728,28 @@ class MPCacheEngine:
                         num_kv_heads=gpu_ctx.group_num_heads[0],
                         head_size=gpu_ctx.group_head_sizes[0],
                         block_size=gpu_ctx.block_size,
+                        max_chunks=max_chunks,
+                        num_groups=(gpu_ctx.kv_layer_groups_manager.num_groups),
+                        is_mla=gpu_ctx.is_mla,
                     )
                     logger.info(
-                        "[kvtunnel C1] real-pack returned tp_rank=%d "
-                        "num_fake=%d blob_logical_shape=%s blob_dtype=%s "
-                        "blob_nbytes=%d",
+                        "[kvtunnel CB] real-pack returned tp_rank=%d "
+                        "num_fake=%d k=%d blob_logical_shape=%s "
+                        "blob_dtype=%s blob_nbytes=%d",
                         tp_rank,
                         num_fake,
-                        tuple(packed.meta.shape),
-                        packed.raw_data.dtype,
-                        packed.get_size(),
+                        len(packed_list),
+                        tuple(packed_list[0].meta.shape),
+                        packed_list[0].raw_data.dtype,
+                        sum(mo.get_size() for mo in packed_list),
                     )
-                # ref_count_up() is non-negotiable: without it the
-                # allocator can reclaim the buffer while a concurrent
+                # ref_count_up on every per-chunk MemoryObj: without it
+                # the allocator can reclaim a buffer while a concurrent
                 # RETRIEVE is mid-copy. MVP leaks entries; a production
-                # TTL eviction is a Phase-4 follow-up.
-                packed.ref_count_up()
-                per_rank[tp_rank] = packed
+                # TTL eviction is the workspace-allocator follow-up.
+                for mem_obj in packed_list:
+                    mem_obj.ref_count_up()
+                per_rank[tp_rank] = packed_list
             _WORKSPACE[marshal_handle] = per_rank
             logger.info(
                 "MARSHAL handle=%s real_tokens=%d num_fake=%d ranks=%d%s",
@@ -864,68 +878,47 @@ class MPCacheEngine:
         per_rank = _WORKSPACE[marshal_handle]
         if tp_rank not in per_rank:
             raise RuntimeError(
-                f"marshal_handle={marshal_handle} has no blob for tp_rank={tp_rank}; "
+                f"marshal_handle={marshal_handle} has no blob for "
+                f"tp_rank={tp_rank}; "
                 f"available ranks={sorted(per_rank.keys())}"
             )
-        mem_obj = per_rank[tp_rank]
+        mem_objs = per_rank[tp_rank]
         if instance_id not in self.gpu_contexts:
             raise RuntimeError(f"KV cache not registered for GPU ID {instance_id}")
         gpu_context = self.gpu_contexts[instance_id]
-        # Debug print for C1 diagnosis: scatter asserts
-        # num_blocks_per_object × block_size == lmcache_chunk_size at
-        # mp_mem_kernels.cu:271-274. If gpu_block_ids count doesn't match
-        # chunk_size/block_size, scatter raises and mq.py:418 swallows
-        # the error → vLLM hangs. Surface it here.
+
+        # Multi-chunk scatter: the pack emits k chunk-sized MemoryObjs.
+        # The kernel `multi_layer_block_kv_transfer` hard-asserts
+        # `num_objects ≤ 4` (`mp_mem_kernels.cu:262-263`) AND
+        # `gpu_context.max_batch_size = 4` (`gpu_context.py:151`). For
+        # k > 4 we issue ceil(k / batch_size) separate kernel launches,
+        # each staging up to 4 chunks via `batched_iteration` — the
+        # same pattern the regular RETRIEVE uses at `server.py:495-557`.
+        k = len(mem_objs)
+        batch_size = gpu_context.max_batch_size
+        blocks_per_chunk = self.chunk_size // gpu_context.block_size
+        expected_block_count = k * blocks_per_chunk
+        if len(gpu_block_ids) != expected_block_count:
+            raise RuntimeError(
+                f"gpu_block_ids count mismatch: got {len(gpu_block_ids)}, "
+                f"expected k*blocks_per_chunk = {k}*{blocks_per_chunk} = "
+                f"{expected_block_count} (k chunks × chunk_size / block_size). "
+                f"Check the connector's num_blocks_needed math."
+            )
         logger.info(
-            "[kvtunnel C1] retrieve_from_workspace handle=%s tp_rank=%d "
-            "instance_id=%d gpu_block_ids_count=%d "
-            "blob_shape=%s blob_dtype=%s blob_nbytes=%d",
+            "[kvtunnel CB] multi-chunk retrieve handle=%s tp_rank=%d "
+            "instance_id=%d k=%d batch_size=%d blocks_per_chunk=%d "
+            "gpu_block_ids_count=%d num_outer_iters=%d",
             marshal_handle,
             tp_rank,
             instance_id,
+            k,
+            batch_size,
+            blocks_per_chunk,
             len(gpu_block_ids),
-            tuple(mem_obj.raw_data.shape),
-            mem_obj.raw_data.dtype,
-            mem_obj.get_size(),
+            (k + batch_size - 1) // batch_size,
         )
 
-        # KV-tunnel real pack emits a blob whose token-axis size is
-        # padded_num_fake (block-size aligned, ≤ chunk_size), not the
-        # full LMCache chunk_size. The scatter kernel takes the token-
-        # axis stride as a runtime argument (`chunk_size_arg`), so we
-        # read the per-blob value from mem_obj.metadata.shape[2] and
-        # pass it instead of self.chunk_size. For stub-mode blobs
-        # (which always span a full chunk) and unrelated paths,
-        # mem_obj.metadata.shape[2] == self.chunk_size, so behavior is
-        # unchanged.
-        blob_shape = tuple(mem_obj.meta.shape)
-        scatter_chunk_tokens = (
-            blob_shape[2]
-            if len(blob_shape) >= 3 and blob_shape[2] <= self.chunk_size
-            else self.chunk_size
-        )
-        # Pre-launch sanity log: surface the kernel's invariant
-        # (num_blocks_per_object × block_size == lmcache_chunk_size_arg,
-        # mp_mem_kernels.cu:271-274) BEFORE the launch, so a TORCH_CHECK
-        # failure is preceded by visible state in the MP log. Without
-        # this, the only artifact of a failure was the swallowed
-        # traceback at mq.py:418-433 ("Error in blocking handler") with
-        # no link back to scatter geometry.
-        bs = gpu_context.block_size
-        invariant_ok = len(gpu_block_ids) * bs == scatter_chunk_tokens
-        logger.info(
-            "[kvtunnel C1] scatter geometry handle=%s tp_rank=%d "
-            "scatter_chunk_tokens=%d blob_shape=%s self.chunk_size=%d "
-            "num_blocks=%d block_size=%d invariant(num_blocks*bs==tokens)=%s",
-            marshal_handle,
-            tp_rank,
-            scatter_chunk_tokens,
-            blob_shape,
-            self.chunk_size,
-            len(gpu_block_ids),
-            bs,
-            invariant_ok,
-        )
         try:
             with (
                 torch.cuda.device(gpu_context.device),
@@ -933,75 +926,72 @@ class MPCacheEngine:
             ):
                 all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
                 event = torch.cuda.Event(interprocess=True)
-                # h2d wrapper requires `gpu_buffer.nbytes == mem_obj.get_size()`.
-                # Slice the staging buffer to the blob's actual byte count
-                # so smaller blobs (real-pack with padded_num_fake <
-                # chunk_size) copy correctly.
-                mem_obj_size = mem_obj.get_size()
-                staging_buf = gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0)[
-                    :mem_obj_size
-                ]
-                logger.info(
-                    "[kvtunnel C1] h2d ENTER handle=%s mem_obj_size=%d "
-                    "staging_nbytes=%d",
-                    marshal_handle,
-                    mem_obj_size,
-                    staging_buf.nbytes,
-                )
-                lmcache_memcpy_async_h2d(mem_obj, staging_buf)
-                logger.info("[kvtunnel C1] h2d EXIT (launch returned)")
                 num_groups = gpu_context.kv_layer_groups_manager.num_groups
-                for group_idx in range(num_groups):
-                    tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
-                        1, group_idx
-                    )
-                    group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
-                    logger.info(
-                        "[kvtunnel C1] scatter ENTER group=%d/%d num_kv_pointers=%d "
-                        "num_tmp_buffers=%d",
-                        group_idx,
-                        num_groups,
-                        len(group_kv_pointers),
-                        len(tmp_buffers),
-                    )
-                    lmc_ops.multi_layer_block_kv_transfer(
-                        group_kv_pointers,
-                        [tb.data_ptr() for tb in tmp_buffers],
-                        all_block_ids_gpu,
-                        gpu_context.device,
-                        lmc_ops.TransferDirection.H2D,
-                        gpu_context.get_shape_desc(group_idx),
-                        scatter_chunk_tokens,
-                        gpu_context.gpu_kv_format_,
-                        0,
-                    )
-                    logger.info(
-                        "[kvtunnel C1] scatter EXIT group=%d (launch returned)",
-                        group_idx,
-                    )
+
+                # Outer loop: iterate batches of ≤ batch_size chunks. Each
+                # iteration stages its chunks into staging slots
+                # 0..batch_len-1, then issues one scatter call per KV
+                # layer group. Mirrors `server.py:495-557` exactly.
+                for batch_idx, mem_obj_batch in enumerate(
+                    batched_iteration(mem_objs, batch_size=batch_size)
+                ):
+                    batch_len = len(mem_obj_batch)
+                    start_chunk_id = batch_idx * batch_size
+                    end_chunk_id = start_chunk_id + batch_len
+                    chunk_block_ids_gpu = all_block_ids_gpu[
+                        start_chunk_id * blocks_per_chunk : end_chunk_id
+                        * blocks_per_chunk
+                    ]
+
+                    # H2D: copy this batch's chunks into staging slots
+                    # 0..batch_len-1. Each per-chunk MemoryObj is sized
+                    # to one chunk's bytes (= tmp_chunk_bytes_), so the
+                    # h2d wrapper's size-equality check at gpu_ops.py:30
+                    # passes without any slicing.
+                    for chunk_idx, mem_obj in enumerate(mem_obj_batch):
+                        lmcache_memcpy_async_h2d(
+                            mem_obj,
+                            gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=chunk_idx),
+                        )
+
+                    # Scatter this batch per KV layer group.
+                    for group_idx in range(num_groups):
+                        tmp_buffers = gpu_context.get_tmp_chunk_gpu_buffer_batched(
+                            batch_len, group_idx
+                        )
+                        group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                        lmc_ops.multi_layer_block_kv_transfer(
+                            group_kv_pointers,
+                            [tb.data_ptr() for tb in tmp_buffers],
+                            chunk_block_ids_gpu,
+                            gpu_context.device,
+                            lmc_ops.TransferDirection.H2D,
+                            gpu_context.get_shape_desc(group_idx),
+                            self.chunk_size,
+                            gpu_context.gpu_kv_format_,
+                            0,
+                        )
+
                 event.record()
-                logger.info("[kvtunnel C1] event.record() returned")
         except Exception:
-            # Surface the exception explicitly in the MP log before it
-            # propagates to mq._notify_response (which will swallow the
-            # response without sending it to vLLM, hanging the client).
-            # mq.py:433 also logs.exception, but having a kvtunnel-tagged
-            # line lets us grep for the failure directly.
+            # Surface the exception explicitly so it's grep-able in the
+            # MP log before mq._notify_response swallows the response
+            # (mq.py:418-433).
             logger.exception(
-                "[kvtunnel C1] retrieve_from_workspace raised handle=%s "
-                "tp_rank=%d scatter_chunk_tokens=%d num_blocks=%d block_size=%d",
+                "[kvtunnel CB] retrieve_from_workspace raised handle=%s "
+                "tp_rank=%d k=%d num_blocks=%d",
                 marshal_handle,
                 tp_rank,
-                scatter_chunk_tokens,
+                k,
                 len(gpu_block_ids),
-                bs,
             )
             raise
-        logger.info("[kvtunnel C1] obtaining ipc_handle handle=%s", marshal_handle)
         ipc_bytes = event.ipc_handle()
         logger.info(
-            "RETRIEVE from workspace handle=%s blocks=%d (returning ipc_handle, success)",
+            "RETRIEVE from workspace handle=%s k=%d blocks=%d "
+            "(returning ipc_handle, success)",
             marshal_handle,
+            k,
             len(gpu_block_ids),
         )
         return ipc_bytes, True
