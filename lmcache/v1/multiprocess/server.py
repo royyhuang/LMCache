@@ -9,7 +9,11 @@ import os
 import threading
 import time
 
-from kvtunnel.marshal.pack import streaming_llm_pack, stub_pack_for_plumbing
+from kvtunnel.marshal.pack import (
+    TunneledRequestMetadata,
+    streaming_llm_pack,
+    stub_pack_for_plumbing,
+)
 
 # Third Party
 import torch
@@ -79,7 +83,10 @@ logger = init_logger(__name__)
 # MVP leaks entries (never deleted): acceptable at tens-of-requests scale
 # since each entry pins a ~hundreds-of-MB CPU tensor. Phase 4 follow-up
 # adds TTL eviction once the proxy is in production.
-_WORKSPACE: dict[str, dict[int, list[MemoryObj]]] = {}
+_WORKSPACE: dict[
+    str,
+    dict[int, tuple[list[MemoryObj], "TunneledRequestMetadata"]],
+] = {}
 
 
 # Helper functions
@@ -622,7 +629,7 @@ class MPCacheEngine:
         real_prompt: list[int],
         method_params: dict,
         worker_id: int,
-    ) -> tuple[bool, int, str]:
+    ) -> tuple[bool, int, str, dict[int, TunneledRequestMetadata]]:
         """Pack the unmarshalled KV for ``real_prompt`` into a workspace blob.
 
         Runs the StreamingLLM selection kernel on CPU: fetches the stored
@@ -646,10 +653,14 @@ class MPCacheEngine:
                 match a prior REGISTER_KV_CACHE call.
 
         Returns:
-            tuple[bool, int, str]: ``(success, num_fake, error_message)``.
+            ``(success, num_fake, error_message, tunneled_request_per_rank)``.
             On success ``num_fake`` is the number of fake slots the packed
-            blob occupies and ``error_message`` is the empty string. On
-            failure ``num_fake`` is 0 and ``error_message`` describes why.
+            blob occupies, ``error_message`` is the empty string, and
+            ``tunneled_request_per_rank`` maps ``tp_rank`` -> per-layer
+            ``TunneledRequestMetadata`` manifest the connector stages on
+            the scheduler so workers build attention metadata without
+            re-parsing block bytes. On failure ``num_fake`` is 0, the
+            manifest map is empty, and ``error_message`` describes why.
         """
         try:
             num_sinks = int(method_params.get("num_sinks", 4))
@@ -667,7 +678,8 @@ class MPCacheEngine:
             # RETRIEVE later addresses its own blob via the worker_id
             # field on its IPCCacheEngineKey — see retrieve() dispatch.
             # For single-GPU world_size=1 this loop runs once.
-            per_rank: dict[int, list[MemoryObj]] = {}
+            per_rank: dict[int, tuple[list[MemoryObj], TunneledRequestMetadata]] = {}
+            tunneled_request_per_rank: dict[int, TunneledRequestMetadata] = {}
             num_fake = 0
             for tp_rank in range(world_size):
                 mem_objs = self._fetch_unmarshalled_for_marshal(
@@ -683,11 +695,13 @@ class MPCacheEngine:
                     # the stub stamps the magic header at every layer's
                     # byte-range start, not just layer 0's.
                     gpu_ctx = self.gpu_contexts[worker_id]
-                    packed_list, num_fake = stub_pack_for_plumbing(
+                    packed_list, manifest = stub_pack_for_plumbing(
                         mem_objs=mem_objs,
                         chunk_size=self.chunk_size,
                         num_layers=gpu_ctx.num_layers,
+                        block_size=gpu_ctx.block_size,
                     )
+                    num_fake = manifest.per_layer[0].num_fake_marshalled
                 else:
                     # Real pack: consume the GPU context's per-rank head
                     # geometry so the pack can validate the chunk's
@@ -718,7 +732,7 @@ class MPCacheEngine:
                         gpu_ctx.kv_layer_groups_manager.num_groups,
                         gpu_ctx.is_mla,
                     )
-                    packed_list, num_fake = streaming_llm_pack(
+                    packed_list, manifest = streaming_llm_pack(
                         mem_objs=mem_objs,
                         chunk_size=self.chunk_size,
                         real_prompt_len=len(real_prompt),
@@ -732,6 +746,7 @@ class MPCacheEngine:
                         num_groups=(gpu_ctx.kv_layer_groups_manager.num_groups),
                         is_mla=gpu_ctx.is_mla,
                     )
+                    num_fake = manifest.per_layer[0].num_fake_marshalled
                     logger.info(
                         "[kvtunnel CB] real-pack returned tp_rank=%d "
                         "num_fake=%d k=%d blob_logical_shape=%s "
@@ -745,11 +760,13 @@ class MPCacheEngine:
                     )
                 # ref_count_up on every per-chunk MemoryObj: without it
                 # the allocator can reclaim a buffer while a concurrent
-                # RETRIEVE is mid-copy. MVP leaks entries; a production
-                # TTL eviction is the workspace-allocator follow-up.
+                # RETRIEVE is mid-copy. The manifest sits next to the
+                # chunks in the workspace tuple — frozen msgspec.Struct,
+                # no ref-count semantics, just stash alongside.
                 for mem_obj in packed_list:
                     mem_obj.ref_count_up()
-                per_rank[tp_rank] = packed_list
+                per_rank[tp_rank] = (packed_list, manifest)
+                tunneled_request_per_rank[tp_rank] = manifest
             _WORKSPACE[marshal_handle] = per_rank
             logger.info(
                 "MARSHAL handle=%s real_tokens=%d num_fake=%d ranks=%d%s",
@@ -759,10 +776,10 @@ class MPCacheEngine:
                 world_size,
                 " (STUB)" if use_stub else "",
             )
-            return (True, num_fake, "")
+            return (True, num_fake, "", tunneled_request_per_rank)
         except Exception as exc:  # noqa: BLE001 — surface error to client
             logger.exception("MARSHAL failed for handle=%s", marshal_handle)
-            return (False, 0, str(exc))
+            return (False, 0, str(exc), {})
 
     def _fetch_unmarshalled_for_marshal(
         self,
@@ -882,7 +899,11 @@ class MPCacheEngine:
                 f"tp_rank={tp_rank}; "
                 f"available ranks={sorted(per_rank.keys())}"
             )
-        mem_objs = per_rank[tp_rank]
+        # Workspace stores (chunks, metadata) per-rank since Phase 1
+        # of plan/tunneled-metadata-for-cuda-graph/. Retrieve only
+        # needs the chunks here; metadata flows through the MARSHAL
+        # response to the proxy + connector.
+        mem_objs, _manifest = per_rank[tp_rank]
         if instance_id not in self.gpu_contexts:
             raise RuntimeError(f"KV cache not registered for GPU ID {instance_id}")
         gpu_context = self.gpu_contexts[instance_id]

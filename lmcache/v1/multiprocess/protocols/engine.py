@@ -13,6 +13,7 @@ This module defines the protocol for:
 """
 
 # First Party
+from kvtunnel.marshal.pack import TunneledRequestMetadata
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
@@ -158,12 +159,16 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - method_params: dict - method-specific params (num_sinks,
         #       window_size, cache_salt); current impl hardcodes StreamingLLM
         #   - worker_id: int - GPU instance ID whose KV cache holds the prompt
-        # Returns: tuple[bool, int, str] - (success, num_fake, error_message).
-        #   On success, error_message == "". num_fake is the number of fake
-        #   slots the marshalled blob occupies, 0 on failure.
+        # Returns: tuple[bool, int, str, dict[int, TunneledRequestMetadata]] —
+        #   (success, num_fake, error_message, tunneled_request_per_rank).
+        #   On success, error_message == "" and tunneled_request_per_rank
+        #   maps tp_rank -> the per-layer TunneledInfo manifest the connector
+        #   stages on the scheduler so workers can build attention metadata
+        #   without re-parsing block bytes. num_fake is the number of fake
+        #   slots the marshalled blob occupies, 0 on failure (manifest is {}).
         "MARSHAL": ProtocolDefinition(
             payload_classes=[str, list[int], dict, int],
-            response_class=tuple[bool, int, str],
+            response_class=tuple[bool, int, str, dict[int, TunneledRequestMetadata]],
             handler_type=HandlerType.BLOCKING,
         ),
     }
