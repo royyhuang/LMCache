@@ -697,6 +697,16 @@ class MPCacheEngine:
                     cache_salt=cache_salt,
                     marshal_handle=marshal_handle,
                 )
+                if mem_objs is None:
+                    # Cold prompt — chunks not in L1. Return a clean
+                    # miss so the proxy can fall back to passthrough
+                    # without an exception + ERROR traceback.
+                    return (
+                        False,
+                        0,
+                        "unmarshalled KV not fully cached in L1",
+                        {},
+                    )
                 if use_stub:
                     # Plumbing-validation mode (pre-Phase-5); see
                     # stub_pack_for_plumbing for semantics. num_layers
@@ -798,7 +808,7 @@ class MPCacheEngine:
         cache_salt: str,
         *,
         marshal_handle: str,
-    ) -> list[MemoryObj]:
+    ) -> list[MemoryObj] | None:
         """Fetch the unmarshalled KV chunks for one TP rank of ``real_prompt``.
 
         Uses the storage manager's prefetch-then-read pattern, same as the
@@ -825,11 +835,13 @@ class MPCacheEngine:
                 based and could collide after GC reuse.
 
         Returns:
-            The ordered list of MemoryObj chunks covering ``real_prompt``.
+            The ordered list of MemoryObj chunks covering ``real_prompt``,
+            or ``None`` if the prompt's chunks are not in L1 (cold
+            prompt — normal operational state, not an error).
 
         Raises:
-            RuntimeError: If the worker is unknown, its layout desc is
-                missing, or any chunk is not resident in L1 storage.
+            RuntimeError: If the worker is unknown or its layout desc
+                is missing.
         """
         if worker_id not in self.gpu_context_meta:
             raise RuntimeError(f"no GPU context registered for worker_id={worker_id}")
@@ -866,7 +878,17 @@ class MPCacheEngine:
             self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
             with self.storage_manager.read_prefetched_results(obj_keys) as mem_objs:
                 if mem_objs is None:
-                    raise RuntimeError("unmarshalled KV not fully cached in L1")
+                    # Cold prompt: chunks aren't in L1 yet. This is
+                    # a normal operational state (first request for
+                    # this prompt), not an error. Return None so the
+                    # caller can report a clean cache-miss without
+                    # an exception + ERROR-level traceback.
+                    logger.info(
+                        "MARSHAL miss: prompt chunks not in L1 "
+                        "(cold prompt, %d chunks)",
+                        len(obj_keys),
+                    )
+                    return None
                 # streaming_llm_pack copies slot bytes into a fresh pinned-CPU
                 # tensor, so the chunks' read locks can safely release after
                 # this method returns. We return the list view — callers must
