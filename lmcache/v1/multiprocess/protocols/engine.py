@@ -33,6 +33,7 @@ REQUEST_NAMES = [
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
     "MARSHAL",
+    "WAIT_STORE",
 ]
 
 # Type alias for cache keys
@@ -169,6 +170,33 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "MARSHAL": ProtocolDefinition(
             payload_classes=[str, list[int], dict, int],
             response_class=tuple[bool, int, str, dict[int, TunneledRequestMetadata]],
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # WAIT_STORE: block until the chunk covering
+        # token_ids[0:end_offset] is committed and readable on every
+        # TP rank, or until wait_timeout_ms elapses. Used by the
+        # kvtunnel proxy's re-tunnel cycle loop to gate the next
+        # cycle's MARSHAL on the previous cycle's STORE having
+        # landed in L1.
+        # Payload:
+        #   - token_ids: list[int] — the running real prompt
+        #     (prompt + decoded so far).
+        #   - end_offset: int — the running prompt length; the
+        #     handler hashes [0:end_offset] and waits on the
+        #     trailing chunk_hash.
+        #   - worker_id: int — GPU instance ID; the handler reads
+        #     gpu_context_meta[worker_id] to learn the TP world
+        #     size, then iterates over TP ranks via
+        #     ipc_key_to_object_keys's worker_id=None expansion.
+        #   - wait_timeout_ms: int — handler's event.wait deadline.
+        #     Proxy supplies it per-call so the timeout is
+        #     configurable (default 3000 ms on the proxy side) and
+        #     supports exponential backoff on retry.
+        # Returns: str — "Ready" if all per-rank chunk objects
+        # were readable within the deadline, "Pending" otherwise.
+        "WAIT_STORE": ProtocolDefinition(
+            payload_classes=[list[int], int, int, int],
+            response_class=str,
             handler_type=HandlerType.BLOCKING,
         ),
     }

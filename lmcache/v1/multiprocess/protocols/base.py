@@ -49,6 +49,7 @@ class RequestType(enum.Enum):
     FREE_LOOKUP_LOCKS = enum.auto()
     END_SESSION = enum.auto()
     MARSHAL = enum.auto()
+    WAIT_STORE = enum.auto()
 
     # Controller operations
     CLEAR = enum.auto()

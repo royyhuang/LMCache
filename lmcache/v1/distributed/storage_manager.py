@@ -149,6 +149,27 @@ class StorageManager:
         return result
 
     @enable_tracing()
+    def is_ready(self, keys: list[ObjectKey]) -> list[bool]:
+        """Return per-key readability for the given keys.
+
+        Each entry is True iff the corresponding object is committed
+        and readable right now (post-finish_write, write-lock
+        released); False if the object is absent OR still
+        write-locked. Delegates to ``L1Manager.is_ready``.
+
+        Best-effort within-call consistency only — see
+        ``L1Manager.is_ready`` for the contract callers need to
+        observe.
+
+        Args:
+            keys: Object keys to query.
+
+        Returns:
+            list[bool] in the same order as ``keys``; True if
+            readable, False otherwise.
+        """
+        return self._l1_manager.is_ready(keys)
+
     def finish_write(
         self,
         keys: list[ObjectKey],

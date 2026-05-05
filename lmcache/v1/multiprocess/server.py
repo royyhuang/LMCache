@@ -8,6 +8,7 @@ import argparse
 import os
 import threading
 import time
+import uuid
 
 from kvtunnel.marshal.pack import (
     TunneledRequestMetadata,
@@ -219,6 +220,13 @@ class MPCacheEngine:
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
 
+        # WAIT_STORE notifier: chunk_hash -> list[Event] of waiters.
+        # finish_write (post-DMA, host-callback thread) signals the
+        # waiters via the wrapped _finish_write_and_signal helper.
+        # No EventBus dependency — sub-ms wakeup, no thundering herd.
+        self._pending_chunk_events: dict[bytes, list[threading.Event]] = {}
+        self._pending_lock = threading.Lock()
+
         self._setup_metrics()
 
     def register_kv_cache(
@@ -391,7 +399,7 @@ class MPCacheEngine:
                 event.record()
                 if reserved_dict:
                     gpu_context.cupy_stream.launch_host_func(
-                        self.storage_manager.finish_write,
+                        self._finish_write_and_signal,
                         list(reserved_dict.keys()),
                     )
                 self._event_bus.publish_on_stream(
@@ -1322,6 +1330,156 @@ class MPCacheEngine:
         #  these keys has been deleted and will not be touched.
         self.storage_manager.touch_l1_keys(obj_keys)
 
+    # ----------------------------------------------------------------
+    # WAIT_STORE — gate the proxy's next MARSHAL on the previous
+    # cycle's STORE having committed to L1. See
+    # plan/proxy-re-tunnel-cycles/design.md §"WAIT_STORE handler".
+    # ----------------------------------------------------------------
+
+    def _signal_chunk_stores(self, chunk_hashes: list[bytes]) -> None:
+        """Wake any waiters registered on the given chunk hashes.
+
+        ``pop()`` under ``_pending_lock``, then ``set()`` outside the
+        lock. STORE-side and WAIT_STORE-side never deadlock on the
+        notifier (no callback runs inside ``e.set()``).
+
+        Args:
+            chunk_hashes: Hashes whose pending waiters to signal.
+        """
+        for chunk_hash in chunk_hashes:
+            with self._pending_lock:
+                events = self._pending_chunk_events.pop(chunk_hash, [])
+            for e in events:
+                e.set()
+
+    def _finish_write_and_signal(self, keys: list[ObjectKey]) -> None:
+        """CUDA host-callback wrapper around ``finish_write``.
+
+        Runs on the cupy stream's host-callback thread. CUDA host
+        callbacks must NOT raise — use ``try/finally`` so the signal
+        fires even if ``finish_write`` itself raises (waiters then
+        re-check is_ready, see False, fall through to "Pending"
+        instead of hanging until their deadline).
+
+        Args:
+            keys: Object keys whose writes have just finished on the
+                GPU; corresponds to the ``reserved_dict.keys()``
+                argument that the original launch_host_func used.
+        """
+        chunk_hashes = [k.chunk_hash for k in keys]
+        try:
+            self.storage_manager.finish_write(keys)
+        except Exception:
+            logger.exception("finish_write raised; signaling waiters")
+        finally:
+            self._signal_chunk_stores(chunk_hashes)
+
+    def wait_store(
+        self,
+        token_ids: list[int],
+        end_offset: int,
+        worker_id: int,
+        wait_timeout_ms: int,
+    ) -> str:
+        """Block until ``token_ids[0:end_offset]``'s last chunk is
+        committed and readable on every TP rank, or timeout.
+
+        See ``plan/proxy-re-tunnel-cycles/design.md`` §"WAIT_STORE
+        handler" for the full design rationale (race walkthrough,
+        per-rank expansion, exception-path handling).
+
+        Args:
+            token_ids: Running real prompt (prompt + decoded so far).
+            end_offset: Length of the running prompt; the handler
+                hashes ``[0:end_offset]`` and waits on the trailing
+                chunk_hash.
+            worker_id: GPU instance ID; used to look up
+                ``gpu_context_meta`` to get model_name + world_size.
+            wait_timeout_ms: ``event.wait`` deadline in milliseconds.
+
+        Returns:
+            ``"Ready"`` if the chunk is readable on every TP rank
+            within the deadline; ``"Pending"`` otherwise.
+
+        Raises:
+            RuntimeError: If ``worker_id`` is not registered.
+        """
+        if worker_id not in self.gpu_context_meta:
+            raise RuntimeError(f"no GPU context registered for worker_id={worker_id}")
+
+        # UUID4 session key — id(token_ids) is non-unique under GC
+        # reuse and can collide between concurrent waiters.
+        session_uuid = uuid.uuid4().hex
+        session_key = f"__wait_store__{session_uuid}__{worker_id}"
+        session = self.session_manager.get_or_create(session_key)
+        event: threading.Event | None = None
+        target_hash: bytes | None = None
+        try:
+            session.set_tokens(list(token_ids))
+            chunk_hashes = [
+                TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0, end_offset)
+            ]
+            target_hash = chunk_hashes[-1]  # only the trailing chunk
+
+            # Cross-rank expansion: worker_id=None makes
+            # ipc_key_to_object_keys iterate range(world_size) and
+            # emit one ObjectKey per TP rank for the same chunk
+            # hash. cache_salt="" matches the connector tracker's
+            # default-empty salt and the proxy's strip-helper
+            # contract (no cache_salt on the wire from any cycle
+            # body).
+            model_name, world_size = self.gpu_context_meta[worker_id]
+            ipc_key = IPCCacheEngineKey(
+                model_name=model_name,
+                world_size=world_size,
+                worker_id=None,
+                token_ids=tuple(token_ids),
+                start=0,
+                end=end_offset,
+                request_id=session_key,
+                cache_salt="",
+            )
+            obj_keys = ipc_key_to_object_keys(ipc_key, [target_hash])
+
+            if all(self.storage_manager.is_ready(obj_keys)):
+                return "Ready"
+
+            # Register an Event BEFORE the second is_ready check.
+            # Closes the race where finish_write completes between
+            # the first is_ready (returns False) and registration:
+            # even if signal_chunk_stores fires before we register,
+            # the second is_ready below sees the post-finish_write
+            # state and returns Ready.
+            event = threading.Event()
+            with self._pending_lock:
+                self._pending_chunk_events.setdefault(target_hash, []).append(event)
+
+            if all(self.storage_manager.is_ready(obj_keys)):
+                return "Ready"
+
+            if event.wait(timeout=wait_timeout_ms / 1000.0):
+                # Re-check is_ready after wakeup. The Event may
+                # have been set by the wrapped finish_write's
+                # exception-path signal: signal fires on exception
+                # but write_lock is still held → not readable.
+                # Without this re-check we'd return Ready
+                # spuriously and the next MARSHAL would fail.
+                if all(self.storage_manager.is_ready(obj_keys)):
+                    return "Ready"
+                return "Pending"
+            return "Pending"
+        finally:
+            # Always remove our Event so _pending_chunk_events
+            # doesn't leak, on every exit path.
+            if event is not None and target_hash is not None:
+                with self._pending_lock:
+                    waiters = self._pending_chunk_events.get(target_hash)
+                    if waiters is not None and event in waiters:
+                        waiters.remove(event)
+                        if not waiters:
+                            self._pending_chunk_events.pop(target_hash, None)
+            self.session_manager.remove(session_key)
+
     def report_status(self) -> dict:
         """Return a status dict for the entire cache engine."""
         sm = self.storage_manager.report_status()
@@ -1496,6 +1654,7 @@ def run_cache_server(
     add_handler_helper(server, RequestType.FREE_LOOKUP_LOCKS, engine.free_lookup_locks)
     add_handler_helper(server, RequestType.RETRIEVE, engine.retrieve)
     add_handler_helper(server, RequestType.MARSHAL, engine.marshal)
+    add_handler_helper(server, RequestType.WAIT_STORE, engine.wait_store)
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
     add_handler_helper(server, RequestType.PING, engine.ping)
@@ -1525,6 +1684,16 @@ def run_cache_server(
             RequestType.MARSHAL,
         ],
         max_workers=mp_config.max_cpu_workers,
+    )
+    # WAIT_STORE on its own pool so its potentially-long blocking
+    # waits (up to repack_wait_store_max_timeout_ms ≈ 30 s with
+    # backoff) can't head-of-line-block MARSHAL or other CPU-pool
+    # work. Pool size is preliminary; Phase 5 measures queue depth +
+    # busy-fraction + per-call hold-time histogram and resizes per
+    # plan/proxy-re-tunnel-cycles/design.md §"Pool registration".
+    server.add_normal_thread_pool(
+        [RequestType.WAIT_STORE],
+        max_workers=8,
     )
 
     logger.info(

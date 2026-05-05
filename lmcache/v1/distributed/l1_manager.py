@@ -798,6 +798,34 @@ class L1Manager:
             "read_ttl_seconds": self._read_ttl_seconds,
         }
 
+    @l1_mgr_synchronized
+    def is_ready(self, keys: list[ObjectKey]) -> list[bool]:
+        """Return per-key readability for the given keys.
+
+        Each entry is True iff the matching object is committed and
+        readable right now (post-finish_write, write-lock released);
+        False if the object is absent OR still write-locked.
+
+        Best-effort within-call consistency: the call holds the
+        manager lock, so all keys are sampled atomically against the
+        same L1 snapshot. Cross-call drift is acceptable — callers
+        that need strict consistency must register an external
+        synchronization primitive (e.g. a threading.Event signalled
+        from finish_write) and re-check is_ready after wakeup.
+
+        Args:
+            keys: Object keys to query.
+
+        Returns:
+            list[bool] in the same order as ``keys``; True if
+            readable, False otherwise.
+        """
+        out: list[bool] = []
+        for k in keys:
+            entry = self._objects.get(k, None)
+            out.append(entry is not None and entry.available_for_read())
+        return out
+
     # Debugging APIs
     @l1_mgr_synchronized
     def get_object_state(self, key: ObjectKey) -> L1ObjectState | None:
