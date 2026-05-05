@@ -4,6 +4,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Callable, Generic, Optional, TypeVar, get_type_hints
 import inspect
+import itertools
 import os
 import queue
 import threading
@@ -139,8 +140,12 @@ class MessageQueueClient:
         )
         self.worker_thread.start()
 
-        # Pending job's futures
-        self.request_counter = 0
+        # Pending job's futures. ``_request_counter`` is an
+        # ``itertools.count``: ``next(...)`` is implemented in C with
+        # the GIL held (CPython), so concurrent producers cannot pick
+        # the same ``request_uid``. Replaces the bare ``int += 1``
+        # the proxy used to guard with an external asyncio.Lock.
+        self._request_counter = itertools.count()
         self.pending_futures: dict[int, MessagingFuture[Any]] = {}
 
     def _process_outbound_task(self):
@@ -228,8 +233,10 @@ class MessageQueueClient:
             MessagingFuture[T]: A future that will hold the response.
         """
         future: MessagingFuture[T] = MessagingFuture()
-        request_uid = self.request_counter
-        self.request_counter += 1
+        # GIL-atomic ``itertools.count.__next__``; no external lock
+        # needed across concurrent producers (proxy used to wrap
+        # this with an asyncio.Lock; v3 drops it).
+        request_uid = next(self._request_counter)
         self.input_queue.put(
             MessageQueueClient.WrappedRequest(
                 request_uid=request_uid,

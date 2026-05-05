@@ -695,6 +695,7 @@ class MPCacheEngine:
                     worker_id=worker_id,
                     tp_rank=tp_rank,
                     cache_salt=cache_salt,
+                    marshal_handle=marshal_handle,
                 )
                 if use_stub:
                     # Plumbing-validation mode (pre-Phase-5); see
@@ -795,6 +796,8 @@ class MPCacheEngine:
         worker_id: int,
         tp_rank: int,
         cache_salt: str,
+        *,
+        marshal_handle: str,
     ) -> list[MemoryObj]:
         """Fetch the unmarshalled KV chunks for one TP rank of ``real_prompt``.
 
@@ -815,6 +818,11 @@ class MPCacheEngine:
             cache_salt: Per-user isolation salt matching the one used when
                 the chunks were originally stored. Empty string matches
                 unsalted entries.
+            marshal_handle: Per-MARSHAL UUID from the proxy. Used as the
+                scratch session key so concurrent MARSHAL calls can't
+                collide on session-manager state. Replaces the previous
+                ``id(real_prompt)`` keying, which was Python-object-id-
+                based and could collide after GC reuse.
 
         Returns:
             The ordered list of MemoryObj chunks covering ``real_prompt``.
@@ -832,7 +840,7 @@ class MPCacheEngine:
                 f"no layout desc for model={model_name} world_size={world_size}"
             )
 
-        scratch_key = f"__marshal__{cache_salt}__{id(real_prompt)}__{tp_rank}"
+        scratch_key = f"__marshal__{marshal_handle}__{tp_rank}"
         session = self.session_manager.get_or_create(scratch_key)
         try:
             session.set_tokens(list(real_prompt))
