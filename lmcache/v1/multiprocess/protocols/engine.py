@@ -34,6 +34,7 @@ REQUEST_NAMES = [
     "END_SESSION",
     "MARSHAL",
     "WAIT_STORE",
+    "MARSHAL_FREE",
 ]
 
 # Type alias for cache keys
@@ -153,7 +154,6 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # header-prepended CPU blob and stash it under `marshal_handle` in
         # the server's workspace dict. A subsequent RETRIEVE carrying the
         # same `marshal_handle` scatters that blob into vLLM's paged cache.
-        # See design/kv-tunneling.md for the byte layout.
         # Payload:
         #   - marshal_handle: str - rendezvous key for the workspace entry
         #   - real_prompt: list[int] - token IDs of the real prompt
@@ -197,6 +197,24 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "WAIT_STORE": ProtocolDefinition(
             payload_classes=[list[int], int, int, int],
             response_class=str,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # MARSHAL_FREE: reclaim the workspace entry stashed under
+        # `marshal_handle` once the request/cycle that consumed it has
+        # finished. Closes O1. Fired by the proxy (which mints the
+        # handle) after the vLLM completion returns — by then the blob's
+        # RETRIEVE H2D has drained, so the freed pinned bytes are read by
+        # no DMA. The handler pops `_WORKSPACE[marshal_handle]` and
+        # schedules `ref_count_down` on the gpu_context stream
+        # (stream-ordered defense for the TTL/abort path); it returns as
+        # soon as the free is *enqueued*, so the ack does NOT mean the
+        # buffer is reclaimed. Unknown handle is a no-op.
+        # Payload:
+        #   - marshal_handle: str - the workspace entry to reclaim.
+        # Returns: None
+        "MARSHAL_FREE": ProtocolDefinition(
+            payload_classes=[str],
+            response_class=None,
             handler_type=HandlerType.BLOCKING,
         ),
     }

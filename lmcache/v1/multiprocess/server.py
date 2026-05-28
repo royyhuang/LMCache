@@ -6,6 +6,7 @@ from itertools import islice
 from typing import Generator
 import argparse
 import os
+import resource
 import threading
 import time
 import uuid
@@ -39,7 +40,8 @@ from lmcache.v1.gpu_connector.gpu_ops import (
     lmcache_memcpy_async_h2d,
 )
 from lmcache.v1.gpu_connector.utils import LayoutHints
-from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
+from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
 from lmcache.v1.mp_observability.config import (
     ObservabilityConfig,
     add_observability_args,
@@ -76,21 +78,45 @@ import lmcache.c_ops as lmc_ops
 logger = init_logger(__name__)
 
 
-# Per-process workspace for KV-tunneled MARSHAL → RETRIEVE rendezvous.
-# Keyed by marshal_handle; value is a per-TP-rank dict because each TP
-# worker retrieves its own KV shard (shards hash to different object keys
-# — see ipc_key_to_object_keys). For single-GPU deployments the inner
-# dict has one entry at rank 0.
-# MVP leaks entries (never deleted): acceptable at tens-of-requests scale
-# since each entry pins a ~hundreds-of-MB CPU tensor. Phase 4 follow-up
-# adds TTL eviction once the proxy is in production.
-_WORKSPACE: dict[
-    str,
-    dict[int, tuple[list[MemoryObj], "TunneledRequestMetadata"]],
-] = {}
+@dataclass
+class WorkspaceEntry:
+    """One KV-tunneled MARSHAL blob set, keyed by ``marshal_handle``.
+
+    ``mem_objs_per_rank`` maps tp_rank -> (k pooled chunk MemoryObjs,
+    manifest) — per-rank because each TP worker retrieves its own KV
+    shard (shards hash to different object keys; see
+    ipc_key_to_object_keys). For single-GPU deployments the inner dict
+    has one entry at rank 0. ``instance_id`` is the GPU instance MARSHAL
+    packed against; MARSHAL_FREE schedules the ``ref_count_down`` on that
+    context's stream.
+
+    Reclaimed by the MARSHAL_FREE RPC the proxy fires when the consuming
+    request/cycle finishes (closes O1) — ``ref_count_down`` returns each
+    chunk to the pinned workspace pool. No more leak.
+    """
+
+    mem_objs_per_rank: dict[int, tuple[list[MemoryObj], TunneledRequestMetadata]]
+    instance_id: int
+
+
+# Per-process workspace for KV-tunneled MARSHAL → RETRIEVE rendezvous,
+# keyed by marshal_handle. Mutated by the MARSHAL handler (write) and the
+# MARSHAL_FREE handler (pop), both under ``MPCacheEngine._workspace_lock``;
+# RETRIEVE only reads.
+_WORKSPACE: dict[str, WorkspaceEntry] = {}
 
 
 # Helper functions
+def _max_locked_memory() -> str:
+    """RLIMIT_MEMLOCK soft limit as a human string.
+
+    Logged at workspace-pool construction so a pinned-alloc OOM at boot is
+    diagnosable: the kvtunnel workspace pool needs ``ulimit -l`` >= its size.
+    """
+    soft = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+    return "unlimited" if soft == resource.RLIM_INFINITY else f"{soft} B"
+
+
 def compute_extra_count(
     tp_size: int,
     world_size: int,
@@ -204,6 +230,28 @@ class MPCacheEngine:
 
         # storage manager
         self.storage_manager = StorageManager(storage_manager_config)
+
+        # kvtunnel MARSHAL workspace pool (closes F1 + O1) — a dedicated
+        # LazyMemoryAllocator inited here alongside the StorageManager's own L1
+        # allocator, but kept separate from it so the two don't share an
+        # eviction policy. Pinned at construction from a fixed byte budget:
+        # KVTUNNEL_WORKSPACE_POOL_GB (default 8); init=pool by default so the
+        # whole pool is pinned eagerly and Lazy's background thread no-ops. The
+        # pack writes into it; MARSHAL_FREE reclaims via _workspace_lock.
+        pool_gb = float(os.environ.get("KVTUNNEL_WORKSPACE_POOL_GB", "8"))
+        pool_bytes = int(pool_gb * (1 << 30))
+        init_gb_env = os.environ.get("KVTUNNEL_WORKSPACE_INIT_GB")
+        init_bytes = int(float(init_gb_env) * (1 << 30)) if init_gb_env else pool_bytes
+        self.kvtunnel_workspace_allocator: MemoryAllocatorInterface = (
+            LazyMemoryAllocator(init_size=init_bytes, final_size=pool_bytes)
+        )
+        self._workspace_lock = threading.Lock()
+        logger.info(
+            "kvtunnel workspace pool: %d B (init %d B); Max locked memory=%s",
+            pool_bytes,
+            init_bytes,
+            _max_locked_memory(),
+        )
 
         # Token hasher and session manager for token-based operations
         self.token_hasher = TokenHasher(
@@ -627,8 +675,9 @@ class MPCacheEngine:
 
     # ------------------------------------------------------------------
     # KV tunneling — MARSHAL RPC and the workspace-driven retrieve path.
-    # See design/kv-tunneling-impl.md §4.6 (on-the-fly marshalling) for
-    # the full flow; this file implements Phase 2 of the MVP.
+    # MARSHAL packs an already-stored prompt's KV on the fly into a
+    # workspace blob; a later RETRIEVE carrying the same marshal_handle
+    # scatters that blob into vLLM's paged cache instead of reading L1.
     # ------------------------------------------------------------------
 
     def marshal(
@@ -708,14 +757,15 @@ class MPCacheEngine:
                         {},
                     )
                 if use_stub:
-                    # Plumbing-validation mode (pre-Phase-5); see
-                    # stub_pack_for_plumbing for semantics. num_layers
-                    # comes from the registered GPU context — needed so
-                    # the stub stamps the magic header at every layer's
-                    # byte-range start, not just layer 0's.
+                    # Plumbing-validation mode; see stub_pack_for_plumbing
+                    # for semantics. num_layers comes from the registered
+                    # GPU context — needed so the stub stamps the magic
+                    # header at every layer's byte-range start, not just
+                    # layer 0's.
                     gpu_ctx = self.gpu_contexts[worker_id]
                     packed_list, manifest = stub_pack_for_plumbing(
-                        mem_objs=mem_objs,
+                        workspace_allocator=self.kvtunnel_workspace_allocator,
+                        orig_kv_obj=mem_objs,
                         chunk_size=self.chunk_size,
                         num_layers=gpu_ctx.num_layers,
                         block_size=gpu_ctx.block_size,
@@ -725,13 +775,12 @@ class MPCacheEngine:
                     # Real pack: consume the GPU context's per-rank head
                     # geometry so the pack can validate the chunk's
                     # KV_2LTD shape and write the header's num_active_heads
-                    # field. Multi-chunk-pack (Case B) emits a list of k
-                    # chunk-sized MemoryObjs; the retrieve path scatters
-                    # them via batched_iteration.
+                    # field. The pack emits a list of k chunk-sized
+                    # MemoryObjs; the retrieve path scatters them via
+                    # batched_iteration.
                     gpu_ctx = self.gpu_contexts[worker_id]
-                    # max_chunks default per plan/multi-chunk-pack §4.5:
-                    # 2× max_batch_size gives headroom past the kernel's
-                    # 4-chunk-per-call cap (mp_mem_kernels.cu:262-263).
+                    # max_chunks: 2× max_batch_size gives headroom past the
+                    # kernel's 4-chunk-per-call cap (mp_mem_kernels.cu:262-263).
                     max_chunks = max(8, gpu_ctx.max_batch_size * 2)
                     logger.info(
                         "[kvtunnel CB] real-pack tp_rank=%d real_prompt_len=%d "
@@ -752,7 +801,8 @@ class MPCacheEngine:
                         gpu_ctx.is_mla,
                     )
                     packed_list, manifest = streaming_llm_pack(
-                        mem_objs=mem_objs,
+                        workspace_allocator=self.kvtunnel_workspace_allocator,
+                        orig_kv_obj=mem_objs,
                         chunk_size=self.chunk_size,
                         real_prompt_len=len(real_prompt),
                         num_sinks=num_sinks,
@@ -777,16 +827,18 @@ class MPCacheEngine:
                         packed_list[0].raw_data.dtype,
                         sum(mo.get_size() for mo in packed_list),
                     )
-                # ref_count_up on every per-chunk MemoryObj: without it
-                # the allocator can reclaim a buffer while a concurrent
-                # RETRIEVE is mid-copy. The manifest sits next to the
-                # chunks in the workspace tuple — frozen msgspec.Struct,
-                # no ref-count semantics, just stash alongside.
-                for mem_obj in packed_list:
-                    mem_obj.ref_count_up()
+                # allocate() already returns each chunk at ref_count=1 —
+                # that single ref IS the workspace's ownership, so no
+                # ref_count_up here (an extra ref would stop the Phase-3
+                # MARSHAL_FREE ref_count_down from freeing). The manifest
+                # sits next to the chunks in the workspace tuple — frozen
+                # msgspec.Struct, no ref-count semantics, just stashed.
                 per_rank[tp_rank] = (packed_list, manifest)
                 tunneled_request_per_rank[tp_rank] = manifest
-            _WORKSPACE[marshal_handle] = per_rank
+            with self._workspace_lock:
+                _WORKSPACE[marshal_handle] = WorkspaceEntry(
+                    mem_objs_per_rank=per_rank, instance_id=worker_id
+                )
             logger.info(
                 "MARSHAL handle=%s real_tokens=%d num_fake=%d ranks=%d%s",
                 marshal_handle,
@@ -930,7 +982,7 @@ class MPCacheEngine:
             tuple[bytes, bool]: CUDA event IPC handle and success flag,
             same shape as :meth:`retrieve`.
         """
-        per_rank = _WORKSPACE[marshal_handle]
+        per_rank = _WORKSPACE[marshal_handle].mem_objs_per_rank
         if tp_rank not in per_rank:
             raise RuntimeError(
                 f"marshal_handle={marshal_handle} has no blob for "
@@ -1360,6 +1412,51 @@ class MPCacheEngine:
         #  these keys has been deleted and will not be touched.
         self.storage_manager.touch_l1_keys(obj_keys)
 
+    def marshal_free(self, marshal_handle: str) -> None:
+        """Reclaim the KV-tunnel workspace entry for ``marshal_handle``.
+
+        Fired by the proxy once the request/cycle that consumed the blob
+        has finished (closes O1 — the never-freed-workspace leak). Pops
+        the entry under ``_workspace_lock``, then schedules the per-chunk
+        ``ref_count_down`` as a stream-ordered host callback on the
+        packing context's stream — the STORE finalize idiom at
+        ``_store_kv``'s ``launch_host_func`` — so a freed chunk's pinned
+        bytes are never reclaimed while an in-flight RETRIEVE H2D is
+        still draining. (The normal proxy path fires this only after the
+        vLLM completion returns, i.e. after the H2D has drained, so it is
+        already safe by timing; the stream-ordering is defense for the
+        abort path.) The handler does pop + enqueue ONLY — the actual
+        free runs later on the cupy callback thread — so it stays O(µs)
+        and never blocks the shared CPU pool. Returns as soon as the free
+        is *enqueued*; the ack does NOT mean the buffer is reclaimed.
+        Unknown / already-freed handle is a no-op.
+
+        Args:
+            marshal_handle: Workspace entry to reclaim.
+        """
+        with self._workspace_lock:
+            entry = _WORKSPACE.pop(marshal_handle, None)
+        if entry is None:
+            return  # unknown / already freed — no-op
+
+        all_chunks = [
+            mem_obj
+            for chunks, _manifest in entry.mem_objs_per_rank.values()
+            for mem_obj in chunks
+        ]
+
+        def _drop(objs: list[MemoryObj]) -> None:
+            for mem_obj in objs:
+                mem_obj.ref_count_down()  # 1 → 0 → parent_allocator.free
+
+        gpu_context = self.gpu_contexts.get(entry.instance_id)
+        if gpu_context is None:
+            # Context already unregistered (teardown) — no DMA can be in
+            # flight against it, so free inline.
+            _drop(all_chunks)
+            return
+        gpu_context.cupy_stream.launch_host_func(_drop, all_chunks)
+
     # ----------------------------------------------------------------
     # WAIT_STORE — gate the proxy's next MARSHAL on the previous
     # cycle's STORE having committed to L1. See
@@ -1592,6 +1689,10 @@ class MPCacheEngine:
         """
         # Close storage manager
         self.storage_manager.close()
+
+        # Free the kvtunnel workspace pool (unregisters the pinned host
+        # buffer; one-time torch.cuda.synchronize on teardown).
+        self.kvtunnel_workspace_allocator.close()
         logger.info("MPCacheEngine closed")
 
         # Release GPU contexts
@@ -1684,6 +1785,7 @@ def run_cache_server(
     add_handler_helper(server, RequestType.FREE_LOOKUP_LOCKS, engine.free_lookup_locks)
     add_handler_helper(server, RequestType.RETRIEVE, engine.retrieve)
     add_handler_helper(server, RequestType.MARSHAL, engine.marshal)
+    add_handler_helper(server, RequestType.MARSHAL_FREE, engine.marshal_free)
     add_handler_helper(server, RequestType.WAIT_STORE, engine.wait_store)
     add_handler_helper(server, RequestType.CLEAR, engine.clear)
     add_handler_helper(server, RequestType.GET_CHUNK_SIZE, engine.get_chunk_size)
@@ -1712,6 +1814,7 @@ def run_cache_server(
             RequestType.PING,
             RequestType.REPORT_BLOCK_ALLOCATION,
             RequestType.MARSHAL,
+            RequestType.MARSHAL_FREE,
         ],
         max_workers=mp_config.max_cpu_workers,
     )

@@ -50,6 +50,7 @@ class RequestType(enum.Enum):
     END_SESSION = enum.auto()
     MARSHAL = enum.auto()
     WAIT_STORE = enum.auto()
+    MARSHAL_FREE = enum.auto()
 
     # Controller operations
     CLEAR = enum.auto()
