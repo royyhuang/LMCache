@@ -691,9 +691,9 @@ class MPCacheEngine:
 
         Runs the StreamingLLM selection kernel on CPU: fetches the stored
         unmarshalled chunks for ``real_prompt``, copies the sink +
-        sliding-window slots into a fresh pinned-CPU tensor with a header
-        prepended, and parks the resulting MemoryObj in ``_WORKSPACE``
-        keyed by ``marshal_handle``. A later RETRIEVE carrying the same
+        sliding-window slots into k fresh pinned-CPU chunk tensors (header
+        in chunk 0), and parks the resulting list of MemoryObjs in
+        ``_WORKSPACE`` keyed by ``marshal_handle``. A later RETRIEVE carrying the same
         ``marshal_handle`` scatters that blob into vLLM's paged cache.
 
         Args:
@@ -961,10 +961,10 @@ class MPCacheEngine:
     ) -> tuple[bytes, bool]:
         """Scatter a workspace blob into vLLM's paged KV cache.
 
-        Mirrors the chunk-scatter loop in :meth:`retrieve` but operates on
-        a single MemoryObj (the marshalled blob) treated as one batched
-        chunk. Unit tests monkey-patch this method to assert the workspace
-        lookup fires without spinning up CUDA.
+        Scatters the k chunk-sized MemoryObjs the pack emitted, in batches
+        of <= max_batch_size, reusing the same chunk-scatter loop as
+        :meth:`retrieve`. Unit tests monkey-patch this method to assert the
+        workspace lookup fires without spinning up CUDA.
 
         Args:
             marshal_handle: Key into ``_WORKSPACE``; the caller guarantees
@@ -1415,7 +1415,7 @@ class MPCacheEngine:
         has finished. Pops the entry under ``_workspace_lock``, then
         schedules the per-chunk ``ref_count_down`` as a stream-ordered host
         callback on the packing context's stream (the STORE finalize idiom
-        at ``_store_kv``'s ``launch_host_func``) so a freed chunk's pinned
+        in ``store()`` at server.py:449) so a freed chunk's pinned
         bytes are never reclaimed while an in-flight RETRIEVE H2D is still
         draining. The normal proxy path fires this only after the vLLM
         completion returns, i.e. after the H2D has drained, so it is
