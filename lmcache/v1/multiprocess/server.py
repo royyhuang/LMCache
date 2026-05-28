@@ -829,7 +829,7 @@ class MPCacheEngine:
                     )
                 # allocate() already returns each chunk at ref_count=1 —
                 # that single ref IS the workspace's ownership, so no
-                # ref_count_up here (an extra ref would stop the Phase-3
+                # ref_count_up here (an extra ref would stop the
                 # MARSHAL_FREE ref_count_down from freeing). The manifest
                 # sits next to the chunks in the workspace tuple — frozen
                 # msgspec.Struct, no ref-count semantics, just stashed.
@@ -948,10 +948,8 @@ class MPCacheEngine:
                 return list(mem_objs)
         finally:
             # Scratch session is single-use: each MARSHAL gets a fresh
-            # key (id(real_prompt) is ephemeral). Without this the
-            # SessionManager dict grows unbounded until the 10-minute
-            # TTL sweep — tracked as a sharp edge in
-            # plan/real-streaming-llm-pack/design.md §6.4.
+            # key. Without this remove, the SessionManager dict grows
+            # unbounded until the 10-minute TTL sweep.
             self.session_manager.remove(scratch_key)
 
     def _retrieve_from_workspace(
@@ -965,9 +963,8 @@ class MPCacheEngine:
 
         Mirrors the chunk-scatter loop in :meth:`retrieve` but operates on
         a single MemoryObj (the marshalled blob) treated as one batched
-        chunk. Integration with a real GPU context is validated in Phase 6;
-        Phase 2 unit tests monkey-patch this method to assert the
-        workspace lookup fires without spinning up CUDA.
+        chunk. Unit tests monkey-patch this method to assert the workspace
+        lookup fires without spinning up CUDA.
 
         Args:
             marshal_handle: Key into ``_WORKSPACE``; the caller guarantees
@@ -989,8 +986,7 @@ class MPCacheEngine:
                 f"tp_rank={tp_rank}; "
                 f"available ranks={sorted(per_rank.keys())}"
             )
-        # Workspace stores (chunks, metadata) per-rank since Phase 1
-        # of plan/tunneled-metadata-for-cuda-graph/. Retrieve only
+        # Workspace stores (chunks, metadata) per-rank. Retrieve only
         # needs the chunks here; metadata flows through the MARSHAL
         # response to the proxy + connector.
         mem_objs, _manifest = per_rank[tp_rank]
@@ -1459,8 +1455,7 @@ class MPCacheEngine:
 
     # ----------------------------------------------------------------
     # WAIT_STORE — gate the proxy's next MARSHAL on the previous
-    # cycle's STORE having committed to L1. See
-    # plan/proxy-re-tunnel-cycles/design.md §"WAIT_STORE handler".
+    # cycle's STORE having committed to L1.
     # ----------------------------------------------------------------
 
     def _signal_chunk_stores(self, chunk_hashes: list[bytes]) -> None:
@@ -1511,9 +1506,10 @@ class MPCacheEngine:
         """Block until ``token_ids[0:end_offset]``'s last chunk is
         committed and readable on every TP rank, or timeout.
 
-        See ``plan/proxy-re-tunnel-cycles/design.md`` §"WAIT_STORE
-        handler" for the full design rationale (race walkthrough,
-        per-rank expansion, exception-path handling).
+        Only the trailing chunk hash is waited on; it is expanded
+        across all TP ranks (worker_id=None) since each rank stores
+        its own shard. The inline comments below walk through the
+        registration/is_ready race and the exception-path re-check.
 
         Args:
             token_ids: Running real prompt (prompt + decoded so far).
@@ -1821,9 +1817,8 @@ def run_cache_server(
     # WAIT_STORE on its own pool so its potentially-long blocking
     # waits (up to repack_wait_store_max_timeout_ms ≈ 30 s with
     # backoff) can't head-of-line-block MARSHAL or other CPU-pool
-    # work. Pool size is preliminary; Phase 5 measures queue depth +
-    # busy-fraction + per-call hold-time histogram and resizes per
-    # plan/proxy-re-tunnel-cycles/design.md §"Pool registration".
+    # work. Pool size is preliminary; resize from measured queue
+    # depth, busy-fraction, and per-call hold-time.
     server.add_normal_thread_pool(
         [RequestType.WAIT_STORE],
         max_workers=8,
