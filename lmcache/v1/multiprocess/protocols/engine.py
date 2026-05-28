@@ -201,14 +201,14 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         ),
         # MARSHAL_FREE: reclaim the workspace entry stashed under
         # `marshal_handle` once the request/cycle that consumed it has
-        # finished. Closes O1. Fired by the proxy (which mints the
-        # handle) after the vLLM completion returns — by then the blob's
-        # RETRIEVE H2D has drained, so the freed pinned bytes are read by
-        # no DMA. The handler pops `_WORKSPACE[marshal_handle]` and
-        # schedules `ref_count_down` on the gpu_context stream
-        # (stream-ordered defense for the TTL/abort path); it returns as
-        # soon as the free is *enqueued*, so the ack does NOT mean the
-        # buffer is reclaimed. Unknown handle is a no-op.
+        # finished. Fired by the proxy (which mints the handle) after the
+        # vLLM completion returns — by then the blob's RETRIEVE H2D has
+        # drained, so no DMA reads the freed pinned bytes. The handler
+        # pops `_WORKSPACE[marshal_handle]` and schedules `ref_count_down`
+        # on the gpu_context stream (stream-ordered to cover the
+        # TTL/abort path); it returns once the free is *enqueued*, so the
+        # ack does NOT mean the buffer is reclaimed. Unknown handle is a
+        # no-op.
         # Payload:
         #   - marshal_handle: str - the workspace entry to reclaim.
         # Returns: None

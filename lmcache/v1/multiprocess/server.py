@@ -91,8 +91,8 @@ class WorkspaceEntry:
     context's stream.
 
     Reclaimed by the MARSHAL_FREE RPC the proxy fires when the consuming
-    request/cycle finishes (closes O1) — ``ref_count_down`` returns each
-    chunk to the pinned workspace pool. No more leak.
+    request/cycle finishes — ``ref_count_down`` returns each chunk to the
+    pinned workspace pool.
     """
 
     mem_objs_per_rank: dict[int, tuple[list[MemoryObj], TunneledRequestMetadata]]
@@ -231,13 +231,13 @@ class MPCacheEngine:
         # storage manager
         self.storage_manager = StorageManager(storage_manager_config)
 
-        # kvtunnel MARSHAL workspace pool (closes F1 + O1) — a dedicated
-        # LazyMemoryAllocator inited here alongside the StorageManager's own L1
-        # allocator, but kept separate from it so the two don't share an
-        # eviction policy. Pinned at construction from a fixed byte budget:
-        # KVTUNNEL_WORKSPACE_POOL_GB (default 8); init=pool by default so the
-        # whole pool is pinned eagerly and Lazy's background thread no-ops. The
-        # pack writes into it; MARSHAL_FREE reclaims via _workspace_lock.
+        # kvtunnel MARSHAL workspace pool — a dedicated LazyMemoryAllocator
+        # kept separate from the StorageManager's L1 allocator so the two
+        # don't share an eviction policy. Pinned at construction from a fixed
+        # byte budget: KVTUNNEL_WORKSPACE_POOL_GB (default 8); init=pool by
+        # default so the whole pool is pinned eagerly and Lazy's background
+        # thread no-ops. The pack writes into it; MARSHAL_FREE reclaims via
+        # _workspace_lock.
         pool_gb = float(os.environ.get("KVTUNNEL_WORKSPACE_POOL_GB", "8"))
         pool_bytes = int(pool_gb * (1 << 30))
         init_gb_env = os.environ.get("KVTUNNEL_WORKSPACE_INIT_GB")
@@ -702,10 +702,10 @@ class MPCacheEngine:
             real_prompt: Token IDs of the real prompt whose KV is already
                 stored unmarshalled in LMCache (populated by a prior normal
                 completion — the miss path).
-            method_params: Method-specific parameters. For MVP we honor
-                only ``num_sinks`` (default 4), ``window_size`` (default
-                1020), and ``cache_salt`` (default empty). Other keys are
-                ignored; future methods will define their own schema.
+            method_params: Method-specific parameters. Only ``num_sinks``
+                (default 4), ``window_size`` (default 1020), and
+                ``cache_salt`` (default empty) are honored; other keys are
+                ignored.
             worker_id: GPU instance ID whose stored KV to look up. Must
                 match a prior REGISTER_KV_CACHE call.
 
@@ -1412,20 +1412,19 @@ class MPCacheEngine:
         """Reclaim the KV-tunnel workspace entry for ``marshal_handle``.
 
         Fired by the proxy once the request/cycle that consumed the blob
-        has finished (closes O1 — the never-freed-workspace leak). Pops
-        the entry under ``_workspace_lock``, then schedules the per-chunk
-        ``ref_count_down`` as a stream-ordered host callback on the
-        packing context's stream — the STORE finalize idiom at
-        ``_store_kv``'s ``launch_host_func`` — so a freed chunk's pinned
-        bytes are never reclaimed while an in-flight RETRIEVE H2D is
-        still draining. (The normal proxy path fires this only after the
-        vLLM completion returns, i.e. after the H2D has drained, so it is
+        has finished. Pops the entry under ``_workspace_lock``, then
+        schedules the per-chunk ``ref_count_down`` as a stream-ordered host
+        callback on the packing context's stream (the STORE finalize idiom
+        at ``_store_kv``'s ``launch_host_func``) so a freed chunk's pinned
+        bytes are never reclaimed while an in-flight RETRIEVE H2D is still
+        draining. The normal proxy path fires this only after the vLLM
+        completion returns, i.e. after the H2D has drained, so it is
         already safe by timing; the stream-ordering is defense for the
-        abort path.) The handler does pop + enqueue ONLY — the actual
-        free runs later on the cupy callback thread — so it stays O(µs)
-        and never blocks the shared CPU pool. Returns as soon as the free
-        is *enqueued*; the ack does NOT mean the buffer is reclaimed.
-        Unknown / already-freed handle is a no-op.
+        abort path. The handler does pop + enqueue ONLY — the actual free
+        runs later on the cupy callback thread — so it stays O(µs) and
+        never blocks the shared CPU pool. Returns as soon as the free is
+        *enqueued*; the ack does NOT mean the buffer is reclaimed. Unknown
+        / already-freed handle is a no-op.
 
         Args:
             marshal_handle: Workspace entry to reclaim.
