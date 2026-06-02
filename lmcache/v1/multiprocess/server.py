@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from itertools import islice
-from typing import Generator
+from typing import Generator, Iterator
 import argparse
 import os
 import resource
@@ -739,102 +740,102 @@ class MPCacheEngine:
             tunneled_request_per_rank: dict[int, TunneledRequestMetadata] = {}
             num_fake = 0
             for tp_rank in range(world_size):
-                mem_objs = self._fetch_unmarshalled_for_marshal(
+                with self._fetch_unmarshalled_for_marshal(
                     real_prompt=real_prompt,
                     worker_id=worker_id,
                     tp_rank=tp_rank,
                     cache_salt=cache_salt,
                     marshal_handle=marshal_handle,
-                )
-                if mem_objs is None:
-                    # Cold prompt — chunks not in L1. Return a clean
-                    # miss so the proxy can fall back to passthrough
-                    # without an exception + ERROR traceback.
-                    return (
-                        False,
-                        0,
-                        "unmarshalled KV not fully cached in L1",
-                        {},
-                    )
-                if use_stub:
-                    # Plumbing-validation mode; see stub_pack_for_plumbing
-                    # for semantics. num_layers comes from the registered
-                    # GPU context — needed so the stub stamps the magic
-                    # header at every layer's byte-range start, not just
-                    # layer 0's.
-                    gpu_ctx = self.gpu_contexts[worker_id]
-                    packed_list, manifest = stub_pack_for_plumbing(
-                        workspace_allocator=self.kvtunnel_workspace_allocator,
-                        orig_kv_obj=mem_objs,
-                        chunk_size=self.chunk_size,
-                        num_layers=gpu_ctx.num_layers,
-                        block_size=gpu_ctx.block_size,
-                    )
-                    num_fake = manifest.per_layer[0].num_fake_marshalled
-                else:
-                    # Real pack: consume the GPU context's per-rank head
-                    # geometry so the pack can validate the chunk's
-                    # KV_2LTD shape and write the header's num_active_heads
-                    # field. The pack emits a list of k chunk-sized
-                    # MemoryObjs; the retrieve path scatters them via
-                    # batched_iteration.
-                    gpu_ctx = self.gpu_contexts[worker_id]
-                    # max_chunks: 2× max_batch_size gives headroom past the
-                    # kernel's 4-chunk-per-call cap (mp_mem_kernels.cu:262-263).
-                    max_chunks = max(8, gpu_ctx.max_batch_size * 2)
-                    logger.info(
-                        "[kvtunnel CB] real-pack tp_rank=%d real_prompt_len=%d "
-                        "chunk_size=%d block_size=%d num_sinks=%d window_size=%d "
-                        "num_layers=%d num_kv_heads=%d head_size=%d "
-                        "max_chunks=%d num_groups=%d is_mla=%s",
-                        tp_rank,
-                        len(real_prompt),
-                        self.chunk_size,
-                        gpu_ctx.block_size,
-                        num_sinks,
-                        window_size,
-                        gpu_ctx.num_layers,
-                        gpu_ctx.group_num_heads[0],
-                        gpu_ctx.group_head_sizes[0],
-                        max_chunks,
-                        gpu_ctx.kv_layer_groups_manager.num_groups,
-                        gpu_ctx.is_mla,
-                    )
-                    packed_list, manifest = streaming_llm_pack(
-                        workspace_allocator=self.kvtunnel_workspace_allocator,
-                        orig_kv_obj=mem_objs,
-                        chunk_size=self.chunk_size,
-                        real_prompt_len=len(real_prompt),
-                        num_sinks=num_sinks,
-                        window_size=window_size,
-                        num_layers=gpu_ctx.num_layers,
-                        num_kv_heads=gpu_ctx.group_num_heads[0],
-                        head_size=gpu_ctx.group_head_sizes[0],
-                        block_size=gpu_ctx.block_size,
-                        max_chunks=max_chunks,
-                        num_groups=(gpu_ctx.kv_layer_groups_manager.num_groups),
-                        is_mla=gpu_ctx.is_mla,
-                    )
-                    num_fake = manifest.per_layer[0].num_fake_marshalled
-                    logger.info(
-                        "[kvtunnel CB] real-pack returned tp_rank=%d "
-                        "num_fake=%d k=%d blob_logical_shape=%s "
-                        "blob_dtype=%s blob_nbytes=%d",
-                        tp_rank,
-                        num_fake,
-                        len(packed_list),
-                        tuple(packed_list[0].meta.shape),
-                        packed_list[0].raw_data.dtype,
-                        sum(mo.get_size() for mo in packed_list),
-                    )
-                # allocate() already returns each chunk at ref_count=1 —
-                # that single ref IS the workspace's ownership, so no
-                # ref_count_up here (an extra ref would stop the
-                # MARSHAL_FREE ref_count_down from freeing). The manifest
-                # sits next to the chunks in the workspace tuple — frozen
-                # msgspec.Struct, no ref-count semantics, just stashed.
-                per_rank[tp_rank] = (packed_list, manifest)
-                tunneled_request_per_rank[tp_rank] = manifest
+                ) as mem_objs:
+                    if mem_objs is None:
+                        # Cold prompt — chunks not in L1. Return a clean
+                        # miss so the proxy can fall back to passthrough
+                        # without an exception + ERROR traceback.
+                        return (
+                            False,
+                            0,
+                            "unmarshalled KV not fully cached in L1",
+                            {},
+                        )
+                    if use_stub:
+                        # Plumbing-validation mode; see stub_pack_for_plumbing
+                        # for semantics. num_layers comes from the registered
+                        # GPU context — needed so the stub stamps the magic
+                        # header at every layer's byte-range start, not just
+                        # layer 0's.
+                        gpu_ctx = self.gpu_contexts[worker_id]
+                        packed_list, manifest = stub_pack_for_plumbing(
+                            workspace_allocator=self.kvtunnel_workspace_allocator,
+                            orig_kv_obj=mem_objs,
+                            chunk_size=self.chunk_size,
+                            num_layers=gpu_ctx.num_layers,
+                            block_size=gpu_ctx.block_size,
+                        )
+                        num_fake = manifest.per_layer[0].num_fake_marshalled
+                    else:
+                        # Real pack: consume the GPU context's per-rank head
+                        # geometry so the pack can validate the chunk's
+                        # KV_2LTD shape and write the header's num_active_heads
+                        # field. The pack emits a list of k chunk-sized
+                        # MemoryObjs; the retrieve path scatters them via
+                        # batched_iteration.
+                        gpu_ctx = self.gpu_contexts[worker_id]
+                        # max_chunks: 2× max_batch_size gives headroom past the
+                        # kernel's 4-chunk-per-call cap (mp_mem_kernels.cu:262-263).
+                        max_chunks = max(8, gpu_ctx.max_batch_size * 2)
+                        logger.info(
+                            "[kvtunnel CB] real-pack tp_rank=%d real_prompt_len=%d "
+                            "chunk_size=%d block_size=%d num_sinks=%d window_size=%d "
+                            "num_layers=%d num_kv_heads=%d head_size=%d "
+                            "max_chunks=%d num_groups=%d is_mla=%s",
+                            tp_rank,
+                            len(real_prompt),
+                            self.chunk_size,
+                            gpu_ctx.block_size,
+                            num_sinks,
+                            window_size,
+                            gpu_ctx.num_layers,
+                            gpu_ctx.group_num_heads[0],
+                            gpu_ctx.group_head_sizes[0],
+                            max_chunks,
+                            gpu_ctx.kv_layer_groups_manager.num_groups,
+                            gpu_ctx.is_mla,
+                        )
+                        packed_list, manifest = streaming_llm_pack(
+                            workspace_allocator=self.kvtunnel_workspace_allocator,
+                            orig_kv_obj=mem_objs,
+                            chunk_size=self.chunk_size,
+                            real_prompt_len=len(real_prompt),
+                            num_sinks=num_sinks,
+                            window_size=window_size,
+                            num_layers=gpu_ctx.num_layers,
+                            num_kv_heads=gpu_ctx.group_num_heads[0],
+                            head_size=gpu_ctx.group_head_sizes[0],
+                            block_size=gpu_ctx.block_size,
+                            max_chunks=max_chunks,
+                            num_groups=(gpu_ctx.kv_layer_groups_manager.num_groups),
+                            is_mla=gpu_ctx.is_mla,
+                        )
+                        num_fake = manifest.per_layer[0].num_fake_marshalled
+                        logger.info(
+                            "[kvtunnel CB] real-pack returned tp_rank=%d "
+                            "num_fake=%d k=%d blob_logical_shape=%s "
+                            "blob_dtype=%s blob_nbytes=%d",
+                            tp_rank,
+                            num_fake,
+                            len(packed_list),
+                            tuple(packed_list[0].meta.shape),
+                            packed_list[0].raw_data.dtype,
+                            sum(mo.get_size() for mo in packed_list),
+                        )
+                    # allocate() already returns each chunk at ref_count=1 —
+                    # that single ref IS the workspace's ownership, so no
+                    # ref_count_up here (an extra ref would stop the
+                    # MARSHAL_FREE ref_count_down from freeing). The manifest
+                    # sits next to the chunks in the workspace tuple — frozen
+                    # msgspec.Struct, no ref-count semantics, just stashed.
+                    per_rank[tp_rank] = (packed_list, manifest)
+                    tunneled_request_per_rank[tp_rank] = manifest
             with self._workspace_lock:
                 _WORKSPACE[marshal_handle] = WorkspaceEntry(
                     mem_objs_per_rank=per_rank, instance_id=worker_id
@@ -852,6 +853,7 @@ class MPCacheEngine:
             logger.exception("MARSHAL failed for handle=%s", marshal_handle)
             return (False, 0, str(exc), {})
 
+    @contextmanager
     def _fetch_unmarshalled_for_marshal(
         self,
         real_prompt: list[int],
@@ -860,13 +862,16 @@ class MPCacheEngine:
         cache_salt: str,
         *,
         marshal_handle: str,
-    ) -> list[MemoryObj] | None:
-        """Fetch the unmarshalled KV chunks for one TP rank of ``real_prompt``.
+    ) -> Iterator[list[MemoryObj] | None]:
+        """Context manager: yield the unmarshalled KV chunks for one TP
+        rank of ``real_prompt`` while holding their L1 read lock.
 
         Uses the storage manager's prefetch-then-read pattern, same as the
-        normal retrieve path. The caller (``marshal``) reads the chunks'
-        raw_data *before* the storage locks are released — pack copies
-        bytes into a fresh tensor so lifetime is safe.
+        normal retrieve path. The read lock is held across the caller's
+        (``marshal``) with-body — the pack copies the chunks' bytes into a
+        fresh pinned tensor there — and released on the success path before
+        the context exits; on the cold-miss / pack-exception path the inner
+        ``read_prefetched_results`` context releases it instead.
 
         Args:
             real_prompt: Token IDs of the real prompt.
@@ -886,7 +891,7 @@ class MPCacheEngine:
                 ``id(real_prompt)`` keying, which was Python-object-id-
                 based and could collide after GC reuse.
 
-        Returns:
+        Yields:
             The ordered list of MemoryObj chunks covering ``real_prompt``,
             or ``None`` if the prompt's chunks are not in L1 (cold
             prompt — normal operational state, not an error).
@@ -930,22 +935,30 @@ class MPCacheEngine:
             self.storage_manager.submit_prefetch_task(obj_keys, layout_desc)
             with self.storage_manager.read_prefetched_results(obj_keys) as mem_objs:
                 if mem_objs is None:
-                    # Cold prompt: chunks aren't in L1 yet. This is
-                    # a normal operational state (first request for
-                    # this prompt), not an error. Return None so the
-                    # caller can report a clean cache-miss without
-                    # an exception + ERROR-level traceback.
+                    # Cold prompt: chunks aren't in L1 yet. A normal
+                    # operational state (first request for this prompt),
+                    # not an error. Yield None so marshal() reports a clean
+                    # cache-miss; the read_prefetched_results context
+                    # releases the partial prefix on the way out.
                     logger.info(
                         "MARSHAL miss: prompt chunks not in L1 "
                         "(cold prompt, %d chunks)",
                         len(obj_keys),
                     )
-                    return None
-                # streaming_llm_pack copies slot bytes into a fresh pinned-CPU
-                # tensor, so the chunks' read locks can safely release after
-                # this method returns. We return the list view — callers must
-                # complete reads before exiting the parent `with`-block.
-                return list(mem_objs)
+                    yield None
+                    return
+                # The pack runs in marshal()'s with-body while this read
+                # lock is held; it copies the source bytes into fresh
+                # pinned-CPU workspace tensors (a synchronous CPU
+                # slice-assign), so once the with-body returns the source
+                # is fully copied and the lock can be released eagerly (no
+                # stream deferral, unlike the async-H2D retrieve path).
+                yield list(mem_objs)
+                # Reached only if marshal()'s with-body completed without
+                # raising: release the source read lock. Success-path only,
+                # exactly-once vs read_prefetched_results' finally, which
+                # releases only on the miss/exception path.
+                self.storage_manager.finish_read_prefetched(obj_keys, extra_count=0)
         finally:
             # Scratch session is single-use: each MARSHAL gets a fresh
             # key. Without this remove, the SessionManager dict grows
