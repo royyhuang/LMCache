@@ -4,7 +4,8 @@ Engine protocol definitions for core KV cache operations.
 
 This module defines the protocol for:
 - REGISTER_KV_CACHE: Register a KV cache instance with the server
-- UNREGISTER_KV_CACHE: Unregister a KV cache instance
+- UNREGISTER_KV_CACHE: Unregister a KV cache instance (GPU path)
+- UNREGISTER_KV_CACHE_NON_GPU_CONTEXT: Unregister a non-GPU KV cache context
 - STORE: Store KV cache blocks to the server
 - RETRIEVE: Retrieve KV cache blocks from the server
 - LOOKUP: Submit a prefix lookup and return a prefetch job ID
@@ -12,14 +13,48 @@ This module defines the protocol for:
 - END_SESSION: End a session and clean up associated resources
 """
 
+# Standard
+from dataclasses import dataclass, field
+
 # First Party
 from kvtunnel.marshal.pack import TunneledRequestMetadata
+from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     IPCCacheEngineKey,
     KVCache,
+    RegisterNonGpuContextPayload,
 )
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
+
+
+@dataclass
+class PrepareStoreResponse:
+    """Response for PREPARE_STORE."""
+
+    context: dict = field(
+        default_factory=dict
+    )  # pickle: {}, shm will put slot info here
+
+
+@dataclass
+class PrepareRetrieveResponse:
+    """Response for PREPARE_RETRIEVE."""
+
+    success: bool
+    data: bytes = b""
+    context: dict = field(
+        default_factory=dict
+    )  # pickle: {}, shm will put slot info here
+
+
+@dataclass
+class RegisterNonGpuContextResponse:
+    """Response for REGISTER_KV_CACHE_NON_GPU_CONTEXT."""
+
+    shm_name: str = ""
+    pool_size: int = 0
+
 
 # Define request names for this protocol group
 REQUEST_NAMES = [
@@ -32,6 +67,12 @@ REQUEST_NAMES = [
     "QUERY_PREFETCH_LOOKUP_HITS",
     "FREE_LOOKUP_LOCKS",
     "END_SESSION",
+    "REGISTER_KV_CACHE_NON_GPU_CONTEXT",
+    "UNREGISTER_KV_CACHE_NON_GPU_CONTEXT",
+    "PREPARE_STORE",
+    "COMMIT_STORE",
+    "PREPARE_RETRIEVE",
+    "COMMIT_RETRIEVE",
     "MARSHAL",
     "WAIT_STORE",
     "MARSHAL_FREE",
@@ -51,14 +92,16 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
     return {
         # Register KV Cache
         # Payload:
-        #   - instance_id: int - Unique identifier for the vLLM instance
+        #   - instance_id: int - Unique identifier for the engine instance
         #   - kv_cache: KVCache - The KV cache configuration
         #   - model_name: str - Name of the model associated with the engine
         #   - world_size: int - World size of the engine
+        #   - engine_type: EngineType - Which serving engine produced the
+        #     caches (vLLM, SGLang, ...). Drives format detection.
         #   - layout_hints: LayoutHints - See custom_types.LayoutHints.
         # Returns: None
         "REGISTER_KV_CACHE": ProtocolDefinition(
-            payload_classes=[int, KVCache, str, int, LayoutHints],
+            payload_classes=[int, KVCache, str, int, EngineType, LayoutHints],
             response_class=None,
             handler_type=HandlerType.SYNC,
         ),
@@ -215,6 +258,44 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         "MARSHAL_FREE": ProtocolDefinition(
             payload_classes=[str],
             response_class=None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # Unregister non-GPU KV cache context
+        # Payload:
+        #   - instance_id: int - Unique identifier for the vLLM instance
+        # Returns: None
+        "UNREGISTER_KV_CACHE_NON_GPU_CONTEXT": ProtocolDefinition(
+            payload_classes=[int],
+            response_class=None,
+            handler_type=HandlerType.SYNC,
+        ),
+        # Register non-GPU KV cache context
+        # Payload:
+        #   - RegisterNonGpuContextPayload - all metadata fields in one struct
+        # Returns: RegisterNonGpuContextResponse
+        "REGISTER_KV_CACHE_NON_GPU_CONTEXT": ProtocolDefinition(
+            payload_classes=[RegisterNonGpuContextPayload],
+            response_class=RegisterNonGpuContextResponse,
+            handler_type=HandlerType.SYNC,
+        ),
+        "PREPARE_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareStoreResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "COMMIT_STORE": ProtocolDefinition(
+            payload_classes=[KeyType, int, bytes],
+            response_class=bool,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "PREPARE_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=PrepareRetrieveResponse,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        "COMMIT_RETRIEVE": ProtocolDefinition(
+            payload_classes=[KeyType, int],
+            response_class=bool,
             handler_type=HandlerType.BLOCKING,
         ),
     }

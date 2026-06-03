@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, NoReturn, Protocol
+import enum
 import os
 import threading
 
@@ -12,6 +13,7 @@ import zmq
 
 # First Party
 from lmcache.integration.request_telemetry.factory import RequestTelemetryFactory
+from lmcache.integration.vllm.utils import vllm_layout_hints
 from lmcache.utils import _lmcache_nvtx_annotate, init_logger
 from lmcache.v1.multiprocess.custom_types import (
     BlockAllocationRecord,
@@ -21,19 +23,112 @@ from lmcache.v1.multiprocess.custom_types import (
 )
 from lmcache.v1.multiprocess.mq import MessageQueueClient, MessagingFuture
 from lmcache.v1.multiprocess.protocol import RequestType, get_response_class
+from lmcache.v1.multiprocess.transfer_context import (
+    DataTransferContext,
+    TransferContext,
+    create_transfer_context,
+)
 from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSummary
 
 logger = init_logger(__name__)
 
-# Timeout (seconds) for blocking MQ requests: initial chunk-size query,
-# KV cache registration/unregistration, and other synchronous operations.
-DEFAULT_MQ_TIMEOUT: float = 300.0
-# Interval (seconds) between periodic heartbeat pings to the server.
-DEFAULT_HEARTBEAT_INTERVAL: float = 10.0
+
+class ExtraConfigDefault(enum.Enum):
+    """Centralized default values for extra_config keys.
+
+    Each member's *name* is the key used in the extra_config dict,
+    and its *value* is the default.
+    """
+
+    # Timeout (seconds) for blocking MQ requests: initial
+    # chunk-size query, KV cache registration/unregistration,
+    # and other synchronous operations.
+    mq_timeout = 300.0
+    # Interval (seconds) between periodic heartbeat pings
+    # to the server.
+    heartbeat_interval = 10.0
+
+
+# Backward-compatible aliases for the legacy `lmcache_mp_connector_0180`
+# entry point, which still passes these as positional/keyword args.
+DEFAULT_MQ_TIMEOUT: float = ExtraConfigDefault.mq_timeout.value
+DEFAULT_HEARTBEAT_INTERVAL: float = ExtraConfigDefault.heartbeat_interval.value
+
+_EXTRA_CONFIG_KEY_PREFIX = "lmcache.mp."
+
+
+def _resolve_extra_config(
+    extra_config: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Resolve extra_config against :class:`ExtraConfigDefault`.
+
+    Keys in *extra_config* are expected to carry the
+    ``lmcache.mp.`` prefix (e.g. ``lmcache.mp.mq_timeout``).
+    The prefix is stripped before matching against
+    :class:`ExtraConfigDefault` members.
+
+    All ``lmcache.mp.*`` entries are logged.  Entries whose
+    value differs from the default are additionally marked as
+    *overridden*.
+
+    Args:
+        extra_config: User-supplied config dict (may be *None*).
+
+    Returns:
+        A dict keyed by :pyattr:`ExtraConfigDefault` member names.
+    """
+    stripped: dict[str, Any] = {}
+    if extra_config is not None:
+        for k, v in extra_config.items():
+            if k.startswith(_EXTRA_CONFIG_KEY_PREFIX):
+                short = k[len(_EXTRA_CONFIG_KEY_PREFIX) :]
+                stripped[short] = v
+
+    resolved: dict[str, Any] = {}
+    for item in ExtraConfigDefault:
+        default = item.value
+        raw = stripped.get(item.name)
+        value = type(default)(raw) if raw is not None else default
+        if value != default:
+            logger.info(
+                "%s%s = %s (overridden, default: %s)",
+                _EXTRA_CONFIG_KEY_PREFIX,
+                item.name,
+                value,
+                default,
+            )
+        else:
+            logger.info(
+                "%s%s = %s",
+                _EXTRA_CONFIG_KEY_PREFIX,
+                item.name,
+                value,
+            )
+        resolved[item.name] = value
+    return resolved
+
+
+class _IpcEvent(Protocol):
+    def ipc_handle(self) -> Any: ...
 
 
 def wrap_kv_caches(kv_caches: dict[str, torch.Tensor]) -> KVCache:
-    logger.info("KV caches keys are %s", list(kv_caches.keys()))
+    # Emit a per-layer (name, shape, dtype) summary so the operator can
+    # verify the exact layer set & tensor geometry being shipped to the
+    # LMCache server, then the low-noise count of handles being wrapped.
+    kept_summary = [
+        (name, tuple(tensor.shape), str(tensor.dtype))
+        for name, tensor in kv_caches.items()
+    ]
+    logger.debug(
+        "KV cache transfer keeping %d layer(s) (name, shape, dtype):\n%s",
+        len(kept_summary),
+        "\n".join(
+            f"  [{i}] {name}  shape={shape}  dtype={dtype}"
+            for i, (name, shape, dtype) in enumerate(kept_summary)
+        ),
+    )
+    logger.info("Wrapping %d KV cache tensors for IPC", len(kv_caches))
     return [CudaIPCWrapper(tensor) for tensor in kv_caches.values()]
 
 
@@ -62,19 +157,51 @@ def send_lmcache_request(
 
 def get_lmcache_chunk_size(
     mq_client: MessageQueueClient,
+    timeout: float = DEFAULT_MQ_TIMEOUT,
 ) -> int:
     """
     Helper function to get the LMCache chunk size from the server
 
     Args:
         mq_client: The LMCache multiprocess mode message queue client
+        timeout: Timeout in seconds for the blocking request.
 
     Returns:
         An integer representing the LMCache chunk size
     """
     future = send_lmcache_request(mq_client, RequestType.GET_CHUNK_SIZE, [])
-    chunk_size = future.result(timeout=DEFAULT_MQ_TIMEOUT)
+    chunk_size = future.result(timeout=timeout)
     return chunk_size
+
+
+def _raise_server_unreachable(server_url: str, timeout: float) -> NoReturn:
+    """Raise a verbose ConnectionError when the LMCache MP server is
+    unreachable.
+
+    The message intentionally spells out the most common cause (the
+    standalone ``lmcache server`` process is not running), the URL that
+    was being dialed, and the exact command to start it -- so that users
+    landing here via ``vllm serve --kv-offloading-backend lmcache`` are
+    not left guessing.
+    """
+    hint = (
+        "Cannot reach the LMCache MP server at "
+        f"'{server_url}' within {timeout}s.\n"
+        "This usually means the standalone LMCache server is not "
+        "running, or it is listening on a different host/port.\n"
+        "To start one locally with the default port (5555):\n"
+        "    lmcache server --l1-size-gb 20 --eviction-policy LRU\n"
+        "To target a different host/port, override via "
+        "kv_connector_extra_config (lmcache.mp.host / lmcache.mp.port), "
+        "e.g.:\n"
+        '    --kv-transfer-config \'{"kv_connector":'
+        '"LMCacheMPConnector","kv_role":"kv_both",'
+        '"kv_connector_extra_config":{"lmcache.mp.host":'
+        '"tcp://localhost","lmcache.mp.port":5555}}\'\n'
+        "See https://docs.lmcache.ai/mp/quickstart.html for details."
+    )
+    logger.warning(hint)
+    raise ConnectionError(hint) from None
 
 
 def send_ping(
@@ -129,6 +256,52 @@ class ParallelStrategy:
     """The pipeline parallel size."""
 
 
+def _normalize_adapter_init_args(
+    vllm_block_size: int,
+    parallel_strategy: ParallelStrategy | int,
+    legacy_block_size: int | None,
+    mq_timeout: float,
+) -> tuple[int, ParallelStrategy, float]:
+    """Normalize adapter constructor args from old and new vLLM connectors.
+
+    Args:
+        vllm_block_size: The vLLM block size for the current connector API, or
+            the legacy KV world size when ``parallel_strategy`` is an int.
+        parallel_strategy: The current ``ParallelStrategy`` object, or the
+            legacy KV worker id from older vLLM MP connectors.
+        legacy_block_size: The legacy vLLM block size passed positionally by
+            older vLLM MP connectors.
+        mq_timeout: Timeout in seconds for synchronous message queue requests.
+
+    Returns:
+        A tuple of normalized ``(vllm_block_size, parallel_strategy,
+        mq_timeout)``.
+
+    Raises:
+        TypeError: If the connector argument shape is not supported.
+    """
+    if isinstance(parallel_strategy, ParallelStrategy):
+        return vllm_block_size, parallel_strategy, mq_timeout
+    if not isinstance(parallel_strategy, int) or legacy_block_size is None:
+        raise TypeError(
+            "parallel_strategy must be ParallelStrategy, or legacy "
+            "(kv_world_size, kv_worker_id, block_size) arguments"
+        )
+
+    kv_world_size = int(vllm_block_size)
+    kv_worker_id = int(parallel_strategy)
+    strategy = ParallelStrategy(
+        use_mla=False,
+        kv_world_size=kv_world_size,
+        kv_worker_id=kv_worker_id,
+        actual_world_size=kv_world_size,
+        actual_worker_id=kv_worker_id,
+        tp_size=kv_world_size,
+        pp_size=1,
+    )
+    return int(legacy_block_size), strategy, mq_timeout
+
+
 class HeartbeatThread(PeriodicThread):
     """Periodically checks server health via PING.
 
@@ -161,9 +334,49 @@ class HeartbeatThread(PeriodicThread):
         self._health_event = health_event
         self._interval = interval
 
+        # Optional callback invoked on the unhealthy->healthy edge,
+        # before the health event is set. See register_recover_callback.
+        def noop() -> bool:
+            return True
+
+        self._recover_callback: Callable[[], bool] = noop
+
+    def register_recover_callback(self, callback: Callable[[], bool]) -> None:
+        """Register a callback fired on the unhealthy->healthy transition.
+
+        The callback runs **before** the health event is set. It must
+        return ``True`` on success (event will be set) or ``False`` on
+        failure (event will stay cleared, and the next heartbeat will
+        invoke the callback again on the next successful PING).
+
+        The callback function should NEVER raise exceptions.
+
+        Intended for setup work that must complete before downstream
+        callers observe the recovery — for example, re-registering KV
+        caches with a server that just restarted.
+
+        Should be called before :meth:`start`. Only one callback is
+        supported; a second call replaces the first.
+
+        Args:
+            callback: Zero-arg callable returning a success bool.
+        """
+        self._recover_callback = callback
+
     def _execute(self) -> ThreadRunSummary:
         was_healthy = self._health_event.is_set()
         healthy = send_ping(self._mq_client, timeout=self._interval)
+        need_trigger_recover = (
+            healthy and not was_healthy and self._recover_callback is not None
+        )
+
+        # Try to call recover callback
+        if need_trigger_recover:
+            logger.warning(
+                "LMCache server is healthy again, triggering recovery callback"
+            )
+            # If the callback fails, it should not become healthy
+            healthy = self._recover_callback()
 
         if healthy:
             self._health_event.set()
@@ -222,9 +435,12 @@ class LMCacheMPSchedulerAdapter:
         context: zmq.Context,
         model_name: str,
         vllm_block_size: int,
-        parallel_strategy: ParallelStrategy,
+        parallel_strategy: ParallelStrategy | int,
+        legacy_block_size: int | None = None,
+        *,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        extra_config: dict[str, Any] | None = None,
     ):
         """
         Args:
@@ -234,10 +450,28 @@ class LMCacheMPSchedulerAdapter:
             vllm_block_size: The block size used in vLLM
             parallel_strategy:
                 The parallel strategy, which includes `use_mla`,
-                `kv_world_size`, `kv_worker_id` and so on
+                `kv_world_size`, `kv_worker_id` and so on. Older vLLM
+                connectors pass the KV worker id here.
+            legacy_block_size: The vLLM block size passed positionally by
+                older vLLM connectors.
             mq_timeout: Timeout in seconds for message queue requests.
+                Ignored when ``extra_config`` is provided.
             heartbeat_interval: Interval in seconds between heartbeat pings.
+                Ignored when ``extra_config`` is provided.
+            extra_config: Optional dict with keys starting with
+                ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
+                provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
         """
+        vllm_block_size, parallel_strategy, mq_timeout = _normalize_adapter_init_args(
+            vllm_block_size,
+            parallel_strategy,
+            legacy_block_size,
+            mq_timeout,
+        )
+        if extra_config is not None:
+            cfg = _resolve_extra_config(extra_config)
+            mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
+            heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -254,13 +488,12 @@ class LMCacheMPSchedulerAdapter:
 
         # Read chunk size from lmcache
         try:
-            self.chunk_size = get_lmcache_chunk_size(self.mq_client)
+            self.chunk_size = get_lmcache_chunk_size(
+                self.mq_client, timeout=self._mq_timeout
+            )
         except TimeoutError:
             self.mq_client.close()
-            raise ConnectionError(
-                f"LMCache server did not respond within {mq_timeout}s. "
-                "Is the server running?"
-            ) from None
+            _raise_server_unreachable(server_url, self._mq_timeout)
         assert self.chunk_size % vllm_block_size == 0, (
             "LMCache chunk size should be a multiple of vLLM block size"
         )
@@ -564,10 +797,46 @@ class LMCacheMPWorkerAdapter:
         context: zmq.Context,
         model_name: str,
         vllm_block_size: int,
-        parallel_strategy: ParallelStrategy,
+        parallel_strategy: ParallelStrategy | int,
+        legacy_block_size: int | None = None,
+        *,
         mq_timeout: float = DEFAULT_MQ_TIMEOUT,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+        extra_config: dict[str, Any] | None = None,
     ):
+        """Initialize the worker adapter for current or legacy vLLM callers.
+
+        Args:
+            server_url: The server URL for the LMCache message queue.
+            context: The ZMQ context.
+            model_name: The model name used for LMCache keys.
+            vllm_block_size: The block size used in vLLM, or legacy KV world
+                size when ``parallel_strategy`` is an int.
+            parallel_strategy: Current ``ParallelStrategy`` metadata, or the
+                legacy KV worker id from older vLLM connectors.
+            legacy_block_size: The vLLM block size passed positionally by
+                older vLLM connectors.
+            mq_timeout: Timeout in seconds for message queue requests.
+                Ignored when ``extra_config`` is provided.
+            heartbeat_interval: Interval in seconds between heartbeat pings.
+                Ignored when ``extra_config`` is provided.
+            extra_config: Optional dict with keys starting with
+                ``lmcache.mp.`` (e.g., ``lmcache.mp.mq_timeout``). When
+                provided, it overrides ``mq_timeout`` / ``heartbeat_interval``.
+
+        Raises:
+            TypeError: If the connector argument shape is unsupported.
+        """
+        vllm_block_size, parallel_strategy, mq_timeout = _normalize_adapter_init_args(
+            vllm_block_size,
+            parallel_strategy,
+            legacy_block_size,
+            mq_timeout,
+        )
+        if extra_config is not None:
+            cfg = _resolve_extra_config(extra_config)
+            mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
+            heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
         self.mq_client = MessageQueueClient(server_url, context)
         self._mq_timeout = mq_timeout
 
@@ -577,12 +846,19 @@ class LMCacheMPWorkerAdapter:
         # Registered kv caches from vLLM
         self.kv_caches: dict[str, torch.Tensor] = {}
 
+        # Transport context for transfer operations.
+        self.transfer_ctx: TransferContext | None = None
+
         # Request futures
         self.store_futures: dict[str, MessagingFuture[StoreResult]] = {}
         # request_id -> (future, block_ids)
         self.retrieve_futures: dict[
             str, tuple[MessagingFuture[RetrieveResult], list[int]]
         ] = {}
+        # The IPC handle is not enough by itself; CUDA needs the exporting
+        # event object to stay alive until the consumer is done with it.
+        self.store_events: dict[str, _IpcEvent] = {}
+        self.retrieve_events: dict[str, _IpcEvent] = {}
 
         # Block IDs that failed due to retrieve timeout
         self.error_block_ids: set[int] = set()
@@ -601,17 +877,24 @@ class LMCacheMPWorkerAdapter:
 
         # Read chunk size from lmcache
         try:
-            chunk_size = get_lmcache_chunk_size(self.mq_client)
+            chunk_size = get_lmcache_chunk_size(
+                self.mq_client, timeout=self._mq_timeout
+            )
         except TimeoutError:
             self.mq_client.close()
-            raise ConnectionError(
-                f"LMCache server did not respond within {mq_timeout}s. "
-                "Is the server running?"
-            ) from None
+            _raise_server_unreachable(server_url, self._mq_timeout)
         assert chunk_size % vllm_block_size == 0, (
             "LMCache chunk size should be a multiple of vLLM block size"
         )
         self.blocks_in_chunk = chunk_size // vllm_block_size
+        # Retain the vLLM logical block size so we can ship it to the
+        # LMCache server in ``register_kv_caches`` — the server uses it
+        # (as ``layout_hints["inference_engine_logical_block_size"]``)
+        # to derive per-group compression ratios when some KV layer
+        # groups compress multiple logical tokens into a single physical
+        # slot (``shape_desc.bs <
+        # inference_engine_logical_block_size``).
+        self.vllm_logical_block_size = vllm_block_size
 
         # Health state (shared with heartbeat thread)
         self._health_event = threading.Event()
@@ -640,7 +923,13 @@ class LMCacheMPWorkerAdapter:
 
     @property
     def is_healthy(self) -> bool:
-        """Whether the LMCache server is healthy."""
+        """Whether the LMCache server is healthy.
+
+        Reflects the most recent heartbeat result. KV cache
+        re-registration on the unhealthy->healthy transition is handled
+        by the heartbeat thread itself via ``register_recover_callback``,
+        so this property only reads the shared event.
+        """
         return self._health_event.is_set()
 
     @property
@@ -666,43 +955,55 @@ class LMCacheMPWorkerAdapter:
             == 0
         )
 
-    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
-        Register the kv caches with LMCache server
+        Register the kv caches with LMCache server.
 
         Args:
             kv_caches: A dict of kv caches to register. The keys are the
                 layer names and the values are the corresponding tensors.
+
+        Raises:
+            ConnectionError: if the server does not respond within
+                mq_timeout.
         """
-        # First Party
-        from lmcache.integration.vllm.utils import vllm_layout_hints
-        from lmcache.v1.gpu_connector.utils import (
-            ensure_contiguous_kv_caches,
-        )
-
-        # Register kv cache and send the request
         logger.info("Registering kv caches")
-
-        layout_hints = vllm_layout_hints()
-        kv_caches = ensure_contiguous_kv_caches(
-            kv_caches, kv_layout=layout_hints.get("kv_layout")
-        )
-
         self.kv_caches = kv_caches
+        self._send_register_kv_caches_request(kv_caches)
 
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.REGISTER_KV_CACHE,
-            [
-                self.instance_id,
-                wrap_kv_caches(kv_caches),
-                self.model_name,
-                self.world_size,
-                layout_hints,
-            ],
+    def _send_register_kv_caches_request(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> None:
+        """Submit a REGISTER_KV_CACHE request and wait for the response.
+
+        Shared by the public ``register_kv_caches`` entry point and the
+        recovery path inside ``is_healthy``.
+
+        Args:
+            kv_caches: The KV cache dict to register.
+
+        Raises:
+            ConnectionError: if the server does not respond within
+                mq_timeout.
+        """
+        self.kv_caches = kv_caches
+        self.transfer_ctx = create_transfer_context(kv_caches)
+        layout_hints = vllm_layout_hints()
+        layout_hints["inference_engine_logical_block_size"] = (
+            self.vllm_logical_block_size
         )
         try:
-            future.result(timeout=self._mq_timeout)
+            self.transfer_ctx.register(
+                self.instance_id,
+                kv_caches,
+                self.model_name,
+                self.world_size,
+                self.blocks_in_chunk,
+                self.mq_client,
+                self._mq_timeout,
+                send_request=send_lmcache_request,
+                layout_hints=layout_hints,
+            )
         except TimeoutError:
             raise ConnectionError(
                 "LMCache server did not respond to "
@@ -722,14 +1023,51 @@ class LMCacheMPWorkerAdapter:
                 health_event=self._health_event,
                 interval=self._heartbeat_interval,
             )
+            self._heartbeat.register_recover_callback(
+                self._reregister_kv_caches_callback
+            )
             self._heartbeat.start()
+
+    def _reregister_kv_caches_callback(self) -> bool:
+        """Heartbeat recover callback: re-register KV caches after the
+        server returns. Runs on the heartbeat thread, before the health
+        event is set.
+
+        Returns:
+            ``True`` if there is nothing to re-register or registration
+            succeeds; ``False`` on registration failure (the heartbeat
+            will keep the health event cleared and retry on the next
+            successful PING).
+        """
+        if not self.kv_caches:
+            # Nothing was registered yet (server flapped before the
+            # very first register_kv_caches). Treat as success so the
+            # health event can be set.
+            return True
+
+        try:
+            self._send_register_kv_caches_request(self.kv_caches)
+            logger.warning("Finished re-registering KV caches after server recovery")
+        except ConnectionError:
+            logger.exception(
+                "Failed to re-register KV caches after server recovery; "
+                "will retry on next heartbeat"
+            )
+            return False
+        except Exception:
+            logger.exception(
+                "Unexpected error during KV cache re-registration; "
+                "will retry on next heartbeat"
+            )
+            return False
+        return True
 
     @_lmcache_nvtx_annotate
     def submit_store_request(
         self,
         request_id: str,
         op: LoadStoreOp,
-        event: torch.cuda.Event,
+        event: _IpcEvent,
         cache_salt: str = "",
     ):
         """
@@ -755,19 +1093,29 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.STORE,
-            [key, self.instance_id, op.block_ids, event.ipc_handle()],
-        ).to_cuda_future()
+        if self.transfer_ctx is None:
+            raise RuntimeError(
+                "Transfer context is not initialized. "
+                "Call register_kv_caches() before submitting store requests."
+            )
+        future = self.transfer_ctx.submit_store(
+            request_id,
+            key,
+            self.instance_id,
+            self.kv_caches,
+            op.block_ids,
+            event,
+            self.blocks_in_chunk,
+        )
         self.store_futures[request_id] = future
+        self.store_events[request_id] = event
 
     @_lmcache_nvtx_annotate
     def submit_retrieve_request(
         self,
         request_id: str,
         op: LoadStoreOp,
-        event: torch.cuda.Event,
+        event: _IpcEvent,
         cache_salt: str = "",
     ):
         """
@@ -794,31 +1142,38 @@ class LMCacheMPWorkerAdapter:
             request_id=request_id,
             cache_salt=cache_salt,
         )
-        # Phase 3: append marshal_handle as the trailing ZMQ payload item.
-        # Empty string when not tunneled; the server falls through to the
-        # stock storage-lookup path in that case. The RETRIEVE
-        # ProtocolDefinition was extended in lockstep (see protocols/
-        # engine.py).
-        future = send_lmcache_request(
-            self.mq_client,
-            RequestType.RETRIEVE,
-            [
-                key,
-                self.instance_id,
-                op.block_ids,
-                event.ipc_handle(),
-                op.skip_first_n_tokens,
-                op.marshal_handle or "",
-            ],
-        ).to_cuda_future()
+        if self.transfer_ctx is None:
+            raise RuntimeError(
+                "Transfer context is not initialized. "
+                "Call register_kv_caches() before submitting retrieve requests."
+            )
+        # kvtunnel: thread marshal_handle to the transfer context. Empty
+        # string when not tunneled; the GPU-path HandleTransferContext
+        # appends it as the trailing RETRIEVE wire item, in lockstep with
+        # the 6-entry RETRIEVE ProtocolDefinition (protocols/engine.py).
+        # On the server, a non-empty handle present in _WORKSPACE routes to
+        # _retrieve_from_workspace; otherwise it falls through to the stock
+        # storage-lookup path.
+        future = self.transfer_ctx.submit_retrieve(
+            request_id,
+            key,
+            self.instance_id,
+            self.kv_caches,
+            op.block_ids,
+            event,
+            self.blocks_in_chunk,
+            skip_first_n_tokens=op.skip_first_n_tokens,
+            marshal_handle=op.marshal_handle or "",
+        )
         self.retrieve_futures[request_id] = (future, list(op.block_ids))
+        self.retrieve_events[request_id] = event
 
     @_lmcache_nvtx_annotate
     def batched_submit_store_requests(
         self,
         request_ids: list[str],
         ops: list[LoadStoreOp],
-        event: torch.cuda.Event,
+        event: _IpcEvent,
         cache_salts: list[str] | None = None,
     ):
         """
@@ -844,7 +1199,7 @@ class LMCacheMPWorkerAdapter:
         self,
         request_ids: list[str],
         ops: list[LoadStoreOp],
-        event: torch.cuda.Event,
+        event: _IpcEvent,
         cache_salts: list[str] | None = None,
     ):
         """
@@ -920,6 +1275,8 @@ class LMCacheMPWorkerAdapter:
                 self.error_block_ids.update(r_block_ids)
             self.store_futures.clear()
             self.retrieve_futures.clear()
+            self.store_events.clear()
+            self.retrieve_events.clear()
 
             ret_stores = self._process_finished_stores(
                 finished_stores, finished_req_ids_from_engine
@@ -966,8 +1323,10 @@ class LMCacheMPWorkerAdapter:
         # Remove the finished requests from the tracking dicts
         for request_id in finished_stores:
             self.store_futures.pop(request_id, None)
+            self.store_events.pop(request_id, None)
         for request_id in finished_retrieves:
             self.retrieve_futures.pop(request_id, None)
+            self.retrieve_events.pop(request_id, None)
 
         # Update the internal states
         ret_stores = self._process_finished_stores(
@@ -1009,9 +1368,14 @@ class LMCacheMPWorkerAdapter:
         """
         logger.info("Unregistering kv caches")
         try:
+            unregister_type = (
+                RequestType.UNREGISTER_KV_CACHE_NON_GPU_CONTEXT
+                if isinstance(self.transfer_ctx, DataTransferContext)
+                else RequestType.UNREGISTER_KV_CACHE
+            )
             send_lmcache_request(
                 self.mq_client,
-                RequestType.UNREGISTER_KV_CACHE,
+                unregister_type,
                 [self.instance_id],
             ).result(timeout=self._mq_timeout)
         except TimeoutError:
@@ -1020,6 +1384,10 @@ class LMCacheMPWorkerAdapter:
                 "Proceeding with shutdown.",
                 self._mq_timeout,
             )
+
+        if self.transfer_ctx is not None:
+            self.transfer_ctx.close()
+            self.transfer_ctx = None
 
         self.mq_client.close()
         self.request_telemetry.close()

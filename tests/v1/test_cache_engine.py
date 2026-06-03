@@ -29,12 +29,19 @@ from .utils import (
     DummyLMCacheAsyncLookupServer,
     check_paged_kv_cache_equal,
     create_gpu_connector,
+    create_test_memory_obj,
     dumb_metadata,
     generate_kv_cache_paged_list_tensors,
     generate_tokens,
     has_cufile,
     recover_engine_states,
 )
+
+# Optional override for tempfile root. In CI we point this at a GDS-capable
+# host-backed mount (see .buildkite/k3_tests/unit/run.sh); locally it's
+# unset and tempfile falls back to its default. Direct-I/O-backed paths are
+# required for GDS tests (cuFile err=5027 on overlayfs/tmpfs).
+_TEST_TMPDIR = os.environ.get("LMCACHE_TEST_TMPDIR") or None
 
 
 def get_expected_count(token_len, save_unfull_chunk, chunk_size):
@@ -972,6 +979,154 @@ def test_paged_prefetch_retrieve(
         subprocess.run(shlex.split("rm -rf local/disk_test/local_disk/"))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_async_lookup_and_prefetch_layerwise(autorelease_v1):
+    # Regression: before the fix, async_lookup_and_prefetch sent chunk-level
+    # CacheEngineKey objects into batched_async_contains, but store_layer
+    # populates hot_cache with per-layer LayerCacheEngineKey objects, so every
+    # lookup reported 0 hits. We stage hot_cache the way store_layer would and
+    # assert async_lookup_and_prefetch reports the full token count.
+    chunk_size = 256
+    num_layers = 4
+    num_chunks = 3
+    num_tokens = chunk_size * num_chunks
+    kv_shape = (num_layers, 2, chunk_size, 8, 128)
+    lookup_id = "layerwise-async-1"
+
+    captured: dict[str, int] = {}
+
+    class _RecordingAsyncLookupServer:
+        def send_response_to_scheduler(
+            self, lookup_id: str, retrieved_length: int
+        ) -> None:
+            captured[lookup_id] = retrieved_length
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_size,
+        backend="cpu",
+        enable_async_loading=True,
+    )
+    cfg.use_layerwise = True
+
+    connector = create_gpu_connector(1024, num_layers)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        ),
+        async_lookup_server=_RecordingAsyncLookupServer(),
+    )
+
+    tokens = generate_tokens(num_tokens, "cuda")
+    chunk_keys = [
+        key for _, _, key in engine.token_database.process_tokens(tokens=tokens)
+    ]
+    assert len(chunk_keys) == num_chunks
+
+    # Populate LocalCPUBackend.hot_cache the way store_layer would: one entry
+    # per (chunk, layer) keyed by LayerCacheEngineKey.
+    cpu_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    for chunk_key in chunk_keys:
+        for layer_key in chunk_key.split_layers(num_layers):
+            cpu_backend.submit_put_task(layer_key, create_test_memory_obj())
+
+    engine.async_lookup_and_prefetch(lookup_id=lookup_id, tokens=tokens)
+
+    deadline = time.time() + 10
+    while (
+        engine.event_manager.get_event_status(EventType.LOADING, lookup_id)
+        != EventStatus.DONE
+    ):
+        if time.time() > deadline:
+            raise TimeoutError("layerwise async lookup did not finish in time")
+        time.sleep(0.01)
+
+    assert captured.get(lookup_id) == num_tokens, (
+        f"Expected retrieved_length={num_tokens}, got {captured.get(lookup_id)}"
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="TODO: Add non-CUDA implementation to VLLMPagedMemGPUConnectorV2",
+)
+def test_async_lookup_and_prefetch_layerwise_partial_layer_missing(autorelease_v1):
+    # When a single per-layer key is missing for one chunk, that chunk must be
+    # rounded down to a miss (the `// keys_per_chunk` round-down path).
+    chunk_size = 256
+    num_layers = 4
+    num_chunks = 3
+    num_tokens = chunk_size * num_chunks
+    kv_shape = (num_layers, 2, chunk_size, 8, 128)
+    lookup_id = "layerwise-async-2"
+
+    captured: dict[str, int] = {}
+
+    class _RecordingAsyncLookupServer:
+        def send_response_to_scheduler(
+            self, lookup_id: str, retrieved_length: int
+        ) -> None:
+            captured[lookup_id] = retrieved_length
+
+    cfg = LMCacheEngineConfig.from_legacy(
+        chunk_size=chunk_size,
+        backend="cpu",
+        enable_async_loading=True,
+    )
+    cfg.use_layerwise = True
+
+    connector = create_gpu_connector(1024, num_layers)
+    engine = autorelease_v1(
+        LMCacheEngineBuilder.get_or_create(
+            "test",
+            cfg,
+            dumb_metadata(kv_shape),
+            connector,
+            mock_up_broadcast_fn,
+            mock_up_broadcast_object_fn,
+        ),
+        async_lookup_server=_RecordingAsyncLookupServer(),
+    )
+
+    tokens = generate_tokens(num_tokens, "cuda")
+    chunk_keys = [
+        key for _, _, key in engine.token_database.process_tokens(tokens=tokens)
+    ]
+
+    # Stage chunks 0 and 1 fully; drop the last per-layer key of chunk 2.
+    cpu_backend = engine.storage_manager.storage_backends["LocalCPUBackend"]
+    for i, chunk_key in enumerate(chunk_keys):
+        per_layer_keys = chunk_key.split_layers(num_layers)
+        if i == len(chunk_keys) - 1:
+            per_layer_keys = per_layer_keys[:-1]
+        for layer_key in per_layer_keys:
+            cpu_backend.submit_put_task(layer_key, create_test_memory_obj())
+
+    engine.async_lookup_and_prefetch(lookup_id=lookup_id, tokens=tokens)
+
+    deadline = time.time() + 10
+    while (
+        engine.event_manager.get_event_status(EventType.LOADING, lookup_id)
+        != EventStatus.DONE
+    ):
+        if time.time() > deadline:
+            raise TimeoutError("layerwise async lookup did not finish in time")
+        time.sleep(0.01)
+
+    # First two chunks are complete; the partially-evicted third chunk is a
+    # miss, so the prefix-match retrieval pattern reports 2 chunks worth.
+    assert captured.get(lookup_id) == 2 * chunk_size, (
+        f"Expected retrieved_length={2 * chunk_size}, got {captured.get(lookup_id)}"
+    )
+
+
 @pytest.mark.parametrize("chunk_size", [256])
 @pytest.mark.parametrize(
     "backend",
@@ -1258,9 +1413,8 @@ def test_force_store_wait(autorelease_v1):
         for _ in range(num_requests)
     ]
 
-    homedir = os.environ.get("HOME", "/tmp")
     with tempfile.TemporaryDirectory(
-        dir=homedir, ignore_cleanup_errors=True
+        dir=_TEST_TMPDIR, ignore_cleanup_errors=True
     ) as temp_dir:
         cfg = LMCacheEngineConfig.from_defaults(
             local_cpu=False,
@@ -1449,9 +1603,8 @@ def test_multi_device_backends(save_unfull_chunk, autorelease_v1):
     with pytest.raises(AssertionError):
         check_paged_kv_cache_equal(retrieved_cache, kv_cache, slot_mapping)
 
-    homedir = os.environ.get("HOME", "/tmp")
     with tempfile.TemporaryDirectory(
-        dir=homedir, ignore_cleanup_errors=True
+        dir=_TEST_TMPDIR, ignore_cleanup_errors=True
     ) as temp_dir:
         cfg = LMCacheEngineConfig.from_dict(
             {
