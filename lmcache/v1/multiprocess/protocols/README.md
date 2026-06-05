@@ -10,6 +10,7 @@ protocols/
 ├── __init__.py        # Protocol initialization and registration
 ├── base.py            # Common types (HandlerType, ProtocolDefinition)
 ├── engine.py          # Engine operations (STORE, RETRIEVE, etc.)
+├── marshal.py         # KV-tunnel MARSHAL ops (MARSHAL, MARSHAL_FREE, WAIT_STORE)
 ├── controller.py      # Controller operations (CLEAR, GET_CHUNK_SIZE)
 └── debug.py           # Debug operations (NOOP)
 ```
@@ -205,6 +206,13 @@ Cache management and configuration:
 ### Debug Operations (`debug.py`)
 Testing and monitoring:
 - `NOOP`: No-operation command for testing/heartbeat
+
+### MARSHAL Operations (`marshal.py`)
+KV-tunnel pack/scatter rendezvous (kvtunnel fork addition; handled by
+`MarshalModule`, not `GPUTransferModule`):
+- `MARSHAL`: Pack an already-stored prompt's KV into a workspace blob
+- `MARSHAL_FREE`: Reclaim a workspace blob once its RETRIEVE has drained
+- `WAIT_STORE`: Block until the source prompt's STORE has committed to L1
 
 ## Handler Types
 

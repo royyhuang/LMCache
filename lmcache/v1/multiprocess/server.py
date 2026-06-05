@@ -42,6 +42,7 @@ from lmcache.v1.multiprocess.gpu_context import GPUCacheContext
 from lmcache.v1.multiprocess.modules.gpu_transfer import GPUTransferModule
 from lmcache.v1.multiprocess.modules.lookup import LookupModule
 from lmcache.v1.multiprocess.modules.management import ManagementModule
+from lmcache.v1.multiprocess.modules.marshal import MarshalModule
 from lmcache.v1.multiprocess.modules.non_gpu_transfer import NonGPUTransferModule
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.protocol import (
@@ -114,10 +115,22 @@ class MPCacheEngine:
 
     @property
     def gpu_contexts(self) -> dict[int, GPUCacheContext] | None:
-        """Used by ``/kvcache/check``; unwraps :class:`GPUContextEntry`."""
+        """Used by ``/kvcache/check``; unwraps :class:`GPUContextEntry`.
+
+        Returns a dict (possibly EMPTY) when a GPU-transfer module is
+        present, and ``None`` only when there is none. Preserves the
+        pre-refactor contract so ``/kvcache/check`` distinguishes a GPU
+        engine with the instance not yet registered (HTTP 404) from a
+        non-GPU engine type (HTTP 501): an empty registry on a GPU engine
+        must stay ``{}``, not ``None``. Contents come from the ctx registry;
+        only the GPU-vs-non-GPU decision consults the module list.
+        """
         for module in self._modules:
             if isinstance(module, GPUTransferModule):
-                return {i: e.gpu_context for i, e in module.gpu_contexts.items()}
+                return {
+                    i: e.gpu_context
+                    for i, e in self._context.gpu_context_registry.items()
+                }
         return None
 
     def clear(self) -> None:
@@ -170,12 +183,18 @@ def _build_modules(
         ManagementModule(ctx),
     ]
 
+    # MarshalModule must be appended AFTER GPUTransferModule: close() runs
+    # modules in list order, so GPUTransferModule.close() stops the
+    # finish-write dispatcher before MarshalModule.close() frees the pinned
+    # workspace pool those callbacks touch.
     if mp_config.supported_transfer_mode == "gpu":
         modules.append(GPUTransferModule(ctx))
+        modules.append(MarshalModule(ctx))
     elif mp_config.supported_transfer_mode == "non_gpu":
         modules.append(NonGPUTransferModule(ctx))
     elif mp_config.supported_transfer_mode == "auto":
         modules.append(GPUTransferModule(ctx))
+        modules.append(MarshalModule(ctx))
         modules.append(NonGPUTransferModule(ctx))
     else:
         raise ValueError(
@@ -224,8 +243,7 @@ def _install_thread_pools(
     normal_types = [
         s.request_type
         for s in all_specs
-        if s.pool == ThreadPoolType.NORMAL
-        and s.request_type != RequestType.WAIT_STORE
+        if s.pool == ThreadPoolType.NORMAL and s.request_type != RequestType.WAIT_STORE
     ]
     if affinity_types:
         server.add_affinity_thread_pool(

@@ -25,21 +25,34 @@ def test_storage_manager_returns_context_storage_manager() -> None:
     assert engine.storage_manager is sm
 
 
-def test_gpu_contexts_unwraps_entries_from_gpu_transfer_module() -> None:
+def test_gpu_contexts_unwraps_entries_from_ctx_registry() -> None:
     gpu0, gpu1 = MagicMock(name="gpu_ctx_0"), MagicMock(name="gpu_ctx_1")
-    gpu_transfer = MagicMock(spec=GPUTransferModule)
-    gpu_transfer.gpu_contexts = {
-        0: GPUContextEntry(gpu_context=gpu0, model_name="m", world_size=1),
-        7: GPUContextEntry(gpu_context=gpu1, model_name="m", world_size=1),
-    }
+    ctx = MagicMock()
+    ctx.gpu_context_registry.items.return_value = [
+        (0, GPUContextEntry(gpu_context=gpu0, model_name="m", world_size=1)),
+        (7, GPUContextEntry(gpu_context=gpu1, model_name="m", world_size=1)),
+    ]
 
-    engine = MPCacheEngine(MagicMock(), modules=[MagicMock(), gpu_transfer])
-    # Values must be unwrapped GPUCacheContexts.
+    engine = MPCacheEngine(ctx, modules=[MagicMock(spec=GPUTransferModule)])
+    # Values must be unwrapped GPUCacheContexts read from ctx.
     assert engine.gpu_contexts == {0: gpu0, 7: gpu1}
 
 
-def test_gpu_contexts_returns_none_in_non_gpu_mode() -> None:
-    engine = MPCacheEngine(MagicMock(), modules=[MagicMock()])
+def test_gpu_contexts_empty_registry_on_gpu_engine_returns_empty_dict() -> None:
+    # Behavior-preserving: a GPU engine with no registrations yet returns
+    # {} (not None), so /kvcache/check stays 404 ("not registered") rather
+    # than flipping to 501 ("not supported for this engine type").
+    ctx = MagicMock()
+    ctx.gpu_context_registry.items.return_value = []
+    engine = MPCacheEngine(ctx, modules=[MagicMock(spec=GPUTransferModule)])
+    assert engine.gpu_contexts == {}
+
+
+def test_gpu_contexts_returns_none_without_a_gpu_module() -> None:
+    # No GPU-transfer module present -> None (-> 501), as before.
+    ctx = MagicMock()
+    ctx.gpu_context_registry.items.return_value = []
+    engine = MPCacheEngine(ctx, modules=[MagicMock()])
     assert engine.gpu_contexts is None
 
 

@@ -1151,9 +1151,9 @@ class LMCacheMPWorkerAdapter:
         # string when not tunneled; the GPU-path HandleTransferContext
         # appends it as the trailing RETRIEVE wire item, in lockstep with
         # the 6-entry RETRIEVE ProtocolDefinition (protocols/engine.py).
-        # On the server, a non-empty handle present in _WORKSPACE routes to
-        # _retrieve_from_workspace; otherwise it falls through to the stock
-        # storage-lookup path.
+        # On the server, a non-empty handle present in ctx.marshal_workspace
+        # routes to MarshalWorkspace.retrieve_into; otherwise it falls
+        # through to the stock storage-lookup path.
         future = self.transfer_ctx.submit_retrieve(
             request_id,
             key,

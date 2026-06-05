@@ -17,7 +17,6 @@ This module defines the protocol for:
 from dataclasses import dataclass, field
 
 # First Party
-from kvtunnel.marshal.pack import TunneledRequestMetadata
 from lmcache.utils import EngineType
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
@@ -73,9 +72,6 @@ REQUEST_NAMES = [
     "COMMIT_STORE",
     "PREPARE_RETRIEVE",
     "COMMIT_RETRIEVE",
-    "MARSHAL",
-    "WAIT_STORE",
-    "MARSHAL_FREE",
 ]
 
 # Type alias for cache keys
@@ -189,73 +185,6 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - request_id: str - Request ID of the session to end
         # Returns: None
         "END_SESSION": ProtocolDefinition(
-            payload_classes=[str],
-            response_class=None,
-            handler_type=HandlerType.BLOCKING,
-        ),
-        # KV tunneling — pack the unmarshalled KV for `real_prompt` into a
-        # header-prepended CPU blob and stash it under `marshal_handle` in
-        # the server's workspace dict. A subsequent RETRIEVE carrying the
-        # same `marshal_handle` scatters that blob into vLLM's paged cache.
-        # Payload:
-        #   - marshal_handle: str - rendezvous key for the workspace entry
-        #   - real_prompt: list[int] - token IDs of the real prompt
-        #   - method_params: dict - method-specific params (num_sinks,
-        #       window_size, cache_salt); current impl hardcodes StreamingLLM
-        #   - worker_id: int - GPU instance ID whose KV cache holds the prompt
-        # Returns: tuple[bool, int, str, dict[int, TunneledRequestMetadata]] —
-        #   (success, num_fake, error_message, tunneled_request_per_rank).
-        #   On success, error_message == "" and tunneled_request_per_rank
-        #   maps tp_rank -> the per-layer TunneledInfo manifest the connector
-        #   stages on the scheduler so workers can build attention metadata
-        #   without re-parsing block bytes. num_fake is the number of fake
-        #   slots the marshalled blob occupies, 0 on failure (manifest is {}).
-        "MARSHAL": ProtocolDefinition(
-            payload_classes=[str, list[int], dict, int],
-            response_class=tuple[bool, int, str, dict[int, TunneledRequestMetadata]],
-            handler_type=HandlerType.BLOCKING,
-        ),
-        # WAIT_STORE: block until the chunk covering
-        # token_ids[0:end_offset] is committed and readable on every
-        # TP rank, or until wait_timeout_ms elapses. Used by the
-        # kvtunnel proxy's re-tunnel cycle loop to gate the next
-        # cycle's MARSHAL on the previous cycle's STORE having
-        # landed in L1.
-        # Payload:
-        #   - token_ids: list[int] — the running real prompt
-        #     (prompt + decoded so far).
-        #   - end_offset: int — the running prompt length; the
-        #     handler hashes [0:end_offset] and waits on the
-        #     trailing chunk_hash.
-        #   - worker_id: int — GPU instance ID; the handler reads
-        #     gpu_context_meta[worker_id] to learn the TP world
-        #     size, then iterates over TP ranks via
-        #     ipc_key_to_object_keys's worker_id=None expansion.
-        #   - wait_timeout_ms: int — handler's event.wait deadline.
-        #     Proxy supplies it per-call so the timeout is
-        #     configurable (default 3000 ms on the proxy side) and
-        #     supports exponential backoff on retry.
-        # Returns: str — "Ready" if all per-rank chunk objects
-        # were readable within the deadline, "Pending" otherwise.
-        "WAIT_STORE": ProtocolDefinition(
-            payload_classes=[list[int], int, int, int],
-            response_class=str,
-            handler_type=HandlerType.BLOCKING,
-        ),
-        # MARSHAL_FREE: reclaim the workspace entry stashed under
-        # `marshal_handle` once the request/cycle that consumed it has
-        # finished. Fired by the proxy (which mints the handle) after the
-        # vLLM completion returns — by then the blob's RETRIEVE H2D has
-        # drained, so no DMA reads the freed pinned bytes. The handler
-        # pops `_WORKSPACE[marshal_handle]` and schedules `ref_count_down`
-        # on the gpu_context stream (stream-ordered to cover the
-        # TTL/abort path); it returns once the free is *enqueued*, so the
-        # ack does NOT mean the buffer is reclaimed. Unknown handle is a
-        # no-op.
-        # Payload:
-        #   - marshal_handle: str - the workspace entry to reclaim.
-        # Returns: None
-        "MARSHAL_FREE": ProtocolDefinition(
             payload_classes=[str],
             response_class=None,
             handler_type=HandlerType.BLOCKING,

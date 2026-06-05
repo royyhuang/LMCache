@@ -15,6 +15,7 @@ from lmcache.v1.multiprocess.protocols import (
     controller,
     debug,
     engine,
+    marshal,
     observability,
 )
 from lmcache.v1.multiprocess.protocols.base import (
@@ -32,6 +33,7 @@ class ProtocolInitializationError(Exception):
 
 _PROTOCOL_MODULES = [
     ("engine", engine),
+    ("marshal", marshal),
     ("controller", controller),
     ("debug", debug),
     ("blend", blend),
