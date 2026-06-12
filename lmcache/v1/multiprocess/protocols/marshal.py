@@ -45,16 +45,25 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   - method_params: dict - method-specific params (num_sinks,
         #       window_size, cache_salt); current impl hardcodes StreamingLLM
         #   - worker_id: int - GPU instance ID whose KV cache holds the prompt
-        # Returns: tuple[bool, int, str, dict[int, TunneledRequestMetadata]] —
-        #   (success, num_fake, error_message, tunneled_request_per_rank).
+        # Returns: tuple[bool, int, str,
+        #   dict[int, TunneledRequestMetadata], int] —
+        #   (success, num_fake, error_message, tunneled_request_per_rank,
+        #   matched_prefix_len).
         #   On success, error_message == "" and tunneled_request_per_rank
         #   maps tp_rank -> the per-layer TunneledInfo manifest the connector
         #   stages on the scheduler so workers can build attention metadata
         #   without re-parsing block bytes. num_fake is the number of fake
         #   slots the marshalled blob occupies, 0 on failure (manifest is {}).
+        #   matched_prefix_len is the chunk-aligned token count of the prefix
+        #   actually packed (== the chunk-aligned length of real_prompt on a
+        #   full match; the proxy pre-truncates to a chunk multiple. 0 on
+        #   failure); the proxy derives the unmatched suffix from it
+        #   (partial-prefix tunneling).
         "MARSHAL": ProtocolDefinition(
             payload_classes=[str, list[int], dict, int],
-            response_class=tuple[bool, int, str, dict[int, TunneledRequestMetadata]],
+            response_class=tuple[
+                bool, int, str, dict[int, TunneledRequestMetadata], int
+            ],
             handler_type=HandlerType.BLOCKING,
         ),
         # WAIT_STORE: block until the chunk covering

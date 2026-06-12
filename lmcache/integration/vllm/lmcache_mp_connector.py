@@ -245,6 +245,10 @@ class LMCacheMPRequestTracker:
         self.kv_transfer_params: dict[str, Any] | None = getattr(
             request, "kv_transfer_params", None
         )
+        # Set once the preempt-resume guard suppresses this request's
+        # substituted STOREs; throttles the warning to one per request
+        # (the guard re-fires on every chunk-boundary tick).
+        self.kvtunnel_store_suppressed: bool = False
 
     ####
     # Check the state of the request
@@ -373,9 +377,11 @@ class LMCacheMPRequestMetadata:
             # token short of the chunk boundary; LMCache hashes a
             # truncated last chunk and the proxy MARSHAL will never
             # match. The cap defers the STORE op to the next scheduler
-            # tick where all_token_ids has caught up — which the proxy
-            # ensures by sending ``max_tokens = chunk_size + 1`` so an
-            # extra tick exists.
+            # tick where all_token_ids has caught up. The cycles proxy
+            # guarantees that extra tick exists by sending
+            # ``max_tokens = chunk_size + slack``; the single-shot
+            # suffix-store path deliberately does NOT (no over-decode)
+            # and accepts graceful loss of a deferred trailing chunk.
             min_available_blocks = min(
                 len(tracker.allocated_block_ids),
                 computed_blocks,
@@ -420,6 +426,33 @@ class LMCacheMPRequestMetadata:
                         "in kv_transfer_params; got None"
                     )
                 num_fake = int(num_fake_raw)
+                # Preempt-resume guard. In normal flow the kv_tunnel_mvp
+                # short-circuit advances num_stored_blocks past the dummy
+                # region at lookup, so start_token_idx >= num_fake here. A
+                # PREEMPTED request gets a FRESH tracker
+                # (num_stored_blocks=0) while kv_transfer_params carry
+                # over, and resume returns (0, False) BEFORE the
+                # short-circuit — no re-RETRIEVE, so vLLM recomputes the
+                # dummy region locally as garbage. Substituting from
+                # start_token_idx < num_fake would key that garbage under
+                # honest real-chain hashes (real_chain_start below maps
+                # block 0 to the tail of the real prefix). Skip the STORE
+                # entirely: num_stored_blocks never advances, so the
+                # resumed request stores nothing — graceful continuity
+                # loss, never corruption.
+                if start_token_idx < num_fake:
+                    if not tracker.kvtunnel_store_suppressed:
+                        tracker.kvtunnel_store_suppressed = True
+                        logger.warning(
+                            "kvtunnel: suppressing substituted STOREs for "
+                            "request %s (start_token_idx=%d < num_fake=%d; "
+                            "preempt-resume recomputed the dummy region — "
+                            "storing it would poison the real chain)",
+                            tracker.request_id,
+                            start_token_idx,
+                            num_fake,
+                        )
+                    return None
                 # Decoded suffix lives in tracker.all_token_ids past
                 # the dummy region. Compose: real prefix + decoded.
                 # `tracker.all_token_ids[num_fake:]` already returns
