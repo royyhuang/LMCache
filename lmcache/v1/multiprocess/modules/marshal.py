@@ -175,29 +175,38 @@ class MarshalModule:
         ``marshal_handle``. A later RETRIEVE carrying the same
         ``marshal_handle`` scatters that blob into vLLM's paged cache.
 
-        Partial (shorter-than-prompt) matches are gated behind
-        ``KVTUNNEL_PARTIAL_PREFIX=1`` (default off: the proxy cannot yet
-        forward the unmatched suffix, so a partial match reports a clean
-        cache-miss exactly like the pre-partial behavior). When enabled, a
-        partial match at or below the compression floor (``num_sinks +
-        window_size + MAX_HEADER_BLOCKS * block_size``) reports a clean
-        cache-miss rather than packing. For TP>1, a probe pass takes the
-        MIN matched length across ranks and every rank packs at it; a
-        rank evicted between the passes reports a clean cache-miss.
+        Longest-prefix matching is unconditional: the returned
+        ``matched_prefix_len`` is the chunk-aligned length of the longest
+        cached prefix (== the full prompt's chunk-aligned length on a full
+        match; shorter on a partial). The hash is auto-rounded
+        (``session.get_hashes(0)``), so an UNALIGNED ``real_prompt`` is
+        accepted — the unaligned tail is excluded and rides the proxy's
+        forwarded suffix. Two floors gate every match (full or partial),
+        each reporting a clean cache-miss rather than packing:
+          - compression floor ``num_sinks + window_size +
+            MAX_HEADER_BLOCKS * block_size`` (`<=`): below it the pack
+            would crash on delta<0.
+          - caller floor ``min_matched_tokens`` (`<`), capped at the
+            chunk-aligned total when the caller asks for the full length
+            (``min_matched_tokens >= len(real_prompt)`` => "full-aligned
+            or miss"; the cycles k>=1 call uses this).
+        For TP>1 with a fractional caller floor, a probe pass takes the MIN
+        matched length across ranks and every rank packs at it (a rank
+        evicted between passes reports a clean cache-miss); a full-required
+        floor skips the probe (the fetch pass enforces all-or-nothing).
 
         Args:
             marshal_handle: Rendezvous key used by the proxy to redeem the
                 workspace entry via RETRIEVE.
             real_prompt: Token IDs of the real prompt whose KV is already
                 stored unmarshalled in LMCache (populated by a prior normal
-                completion — the miss path).
+                completion — the miss path). May be unaligned (the trailing
+                sub-chunk tail is excluded from the match).
             method_params: Method-specific parameters. Only ``num_sinks``
-                (default 4), ``window_size`` (default 1020),
-                ``cache_salt`` (default empty), and ``allow_partial``
-                (default False — the caller must opt in to receive a
-                partial-prefix success; callers that can't forward the
-                unmatched suffix, e.g. the chat and cycles proxy paths,
-                never set it) are honored; other keys are ignored.
+                (default 4), ``window_size`` (default 1020), ``cache_salt``
+                (default empty), and ``min_matched_tokens`` (default 0 — the
+                caller floor described above; 0 means "any match above the
+                compression floor") are honored; other keys are ignored.
             worker_id: GPU instance ID whose stored KV to look up. Must
                 match a prior REGISTER_KV_CACHE call.
 
@@ -210,12 +219,12 @@ class MarshalModule:
             stages on the scheduler so workers build attention metadata
             without re-parsing block bytes, and ``matched_prefix_len`` is
             the chunk-aligned token count of the prefix that was actually
-            packed (== the chunk-aligned length of ``real_prompt`` on a
-            full match — the proxy pre-truncates to a chunk multiple, so
-            in practice == ``len(real_prompt)``; the proxy derives the
-            unmatched suffix from it). On failure ``num_fake``
+            packed (== ``align_down(len(real_prompt))`` on a full match;
+            smaller on a partial; the proxy derives the unmatched suffix as
+            ``real_prompt[matched_prefix_len:]``). On failure ``num_fake``
             and ``matched_prefix_len`` are 0, the manifest map is empty,
-            and ``error_message`` describes why.
+            and ``error_message`` describes why (always prefixed with the
+            byte-stable ``_L1_MISS_MSG`` on a clean cache-miss).
         """
         # Hoisted above the try so the cleanup below can always reference
         # them: blobs packed for earlier ranks must be freed on EVERY
@@ -236,9 +245,9 @@ class MarshalModule:
 
         try:
             num_sinks = int(method_params.get("num_sinks", 4))
-            allow_partial = bool(method_params.get("allow_partial", False))
             window_size = int(method_params.get("window_size", 1020))
             cache_salt = str(method_params.get("cache_salt", ""))
+            min_matched_tokens = int(method_params.get("min_matched_tokens", 0))
 
             entry = self._ctx.gpu_context_registry.get(worker_id)
             if entry is None:
@@ -256,24 +265,34 @@ class MarshalModule:
                 raise RuntimeError("MARSHAL workspace is not initialized")
             workspace_allocator = workspace.kvtunnel_workspace_allocator
 
-            # Partial-prefix tunneling is gated until the proxy can build
-            # the [num_fake + K-real-suffix] dummy prompt (Phases 3-4): a
-            # partial SUCCESS today would make the proxy drop every suffix
-            # token but the last — a silent wrong-answer. Default-off; the
-            # Phase-4 proxy flips it on.
-            partial_enabled = os.environ.get("KVTUNNEL_PARTIAL_PREFIX", "0") == "1"
-
             gpu_ctx = entry.gpu_context
             kvlgm = gpu_ctx.kv_layer_groups_manager
             ie_block_size = kvlgm.inference_engine_logical_block_size
-            # Compression floor for a PARTIAL match (see the guard below):
-            # at or below it StreamingLLM retains (nearly) the whole
-            # prefix, so num_fake can reach matched_prefix_len + header
-            # and the pack hard-fails on delta < 0. The header term
-            # matters — retained alone clearing sinks+window still leaves
-            # num_fake > matched when the block-aligned header pushes
-            # content into one more chunk.
-            partial_floor = num_sinks + window_size + MAX_HEADER_BLOCKS * ie_block_size
+            # Compression floor — applies to EVERY match (full or partial):
+            # at or below it StreamingLLM retains (nearly) the whole prefix,
+            # so num_fake reaches matched_prefix_len + header and the pack
+            # hard-fails on delta < 0. The header term matters — retained
+            # alone clearing sinks+window still leaves num_fake > matched
+            # when the block-aligned header pushes content into one more
+            # chunk. Previously this guarded only the partial branch (the
+            # proxy's min-length gate kept full matches above it); with that
+            # gate dropped a small FULL match can now land here, so the check
+            # is universal (boundary: `<=`, the delta<0 hazard is at-or-below).
+            compression_floor = (
+                num_sinks + window_size + MAX_HEADER_BLOCKS * ie_block_size
+            )
+
+            # Caller match floor with a "require-full" cap. A caller asking
+            # for >= the full received length (the cycles k>=1 call sends
+            # len(real_prompt)) means "full aligned prefix or miss" — cap the
+            # floor at the chunk-aligned total so an unaligned tail never
+            # forces a miss. A fractional ask (k==0's ceil(frac*len) < total)
+            # stays raw. Boundary: `<` (a fractional ask of N tunnels AT N).
+            total = len(real_prompt)
+            total_chunks = total // self._ctx.chunk_size
+            aligned_total = total_chunks * self._ctx.chunk_size
+            require_full = min_matched_tokens >= total
+            match_floor = aligned_total if require_full else min_matched_tokens
 
             # Pack one workspace blob per TP rank. Each TP worker's
             # RETRIEVE later addresses its own blob via the worker_id
@@ -281,7 +300,6 @@ class MarshalModule:
             # For single-GPU world_size=1 this loop runs once.
             tunneled_request_per_rank: dict[int, TunneledRequestMetadata] = {}
             num_fake = 0
-            total_chunks = len(real_prompt) // self._ctx.chunk_size
             # Longest-prefix match. All ranks must pack the SAME matched
             # length so num_fake is identical across ranks (the proxy
             # sends ONE num_fake). Single rank: one pass, the fetch's own
@@ -291,12 +309,15 @@ class MarshalModule:
             # evicted between the passes surfaces as a shrink below the
             # cap -> clean miss (accepted TOCTOU).
             limit_chunks = 0
-            if world_size > 1 and partial_enabled and allow_partial:
-                # Gate-off OR a non-opted-in caller skips the probe:
-                # all-or-nothing requires every rank to match the FULL
-                # prompt, which the fetch pass checks by itself (matched
-                # < total -> clean miss), so the probe would pay an extra
-                # submit+hash round per rank for an identical outcome.
+            if world_size > 1 and not require_full:
+                # require_full skips the probe: all-or-nothing means every
+                # rank must match the FULL aligned prefix, which the fetch
+                # pass checks by itself (matched < match_floor -> clean
+                # miss), so the probe would pay an extra submit+hash round
+                # per rank for an identical outcome. A fractional floor
+                # (k==0) DOES probe — ranks may legitimately match different
+                # partial lengths, and we pack them all at the cross-rank
+                # min.
                 rank_hits = [
                     self._probe_prefix_hit_count(
                         real_prompt=real_prompt,
@@ -308,8 +329,17 @@ class MarshalModule:
                     for tp_rank in range(world_size)
                 ]
                 limit_chunks = min(rank_hits)
-                if limit_chunks == 0:
-                    return (False, 0, _L1_MISS_MSG, {}, 0)
+                matched_at_min = limit_chunks * self._ctx.chunk_size
+                if matched_at_min <= compression_floor or matched_at_min < match_floor:
+                    # Cross-rank min is cold/too-short to clear either floor
+                    # — clean miss BEFORE any fetch/lock or pack.
+                    return (
+                        False,
+                        0,
+                        _L1_MISS_MSG + " (cross-rank min below floor)",
+                        {},
+                        0,
+                    )
                 if limit_chunks < total_chunks:
                     logger.info(
                         "MARSHAL TP min-prefix: rank hits %s -> packing "
@@ -355,47 +385,38 @@ class MarshalModule:
                             {},
                             0,
                         )
-                    if matched_chunks < total_chunks:
-                        if not partial_enabled:
-                            # Gate off: preserve today's all-or-nothing
-                            # behavior exactly (partial -> clean miss).
-                            _free_packed()
-                            return (
-                                False,
-                                0,
-                                _L1_MISS_MSG + " (partial-prefix tunneling disabled)",
-                                {},
-                                0,
-                            )
-                        if not allow_partial:
-                            # Caller didn't opt in: a partial success
-                            # would silently truncate its answer (it
-                            # cannot forward the unmatched suffix).
-                            # Clean miss, exactly like gate-off.
-                            _free_packed()
-                            return (
-                                False,
-                                0,
-                                _L1_MISS_MSG + " (caller did not allow partial match)",
-                                {},
-                                0,
-                            )
-                        # Treat a too-short partial match (at or below the
-                        # floor computed above) as a clean miss
-                        # (byte-stable message — the proxy's cache-miss
-                        # classifier substring-matches it) instead of a
-                        # delta<0 pack exception that would surface as a
-                        # 503. Full matches keep today's behavior.
-                        if matched_prefix_len <= partial_floor:
-                            _free_packed()
-                            return (
-                                False,
-                                0,
-                                _L1_MISS_MSG + " (partial prefix at or below"
-                                " compression floor)",
-                                {},
-                                0,
-                            )
+                    # Floor enforcement — full OR partial. Both checks are
+                    # universal: the dropped proxy size gate now lets a
+                    # small FULL match land here below the compression
+                    # floor, which would crash the pack on delta<0, so
+                    # neither floor is partial-only anymore. Byte-stable
+                    # miss messages (shared _L1_MISS_MSG prefix) so the
+                    # proxy's classifier substring-matches them rather than
+                    # surfacing a 503.
+                    #   (a) compression floor: `<=` (at-or-below, the
+                    #       StreamingLLM-retention delta<0 hazard).
+                    #   (b) caller floor: `<` (a fractional k==0 ask of N
+                    #       tunnels AT N; k>=1's require-full ask caps
+                    #       match_floor at aligned_total, so a partial ->
+                    #       matched < match_floor -> clean miss).
+                    if matched_prefix_len <= compression_floor:
+                        _free_packed()
+                        return (
+                            False,
+                            0,
+                            _L1_MISS_MSG + " (at or below compression floor)",
+                            {},
+                            0,
+                        )
+                    if matched_prefix_len < match_floor:
+                        _free_packed()
+                        return (
+                            False,
+                            0,
+                            _L1_MISS_MSG + " (below min_matched_tokens floor)",
+                            {},
+                            0,
+                        )
                     if use_stub:
                         # Plumbing-validation mode; see stub_pack_for_plumbing
                         # for semantics. num_layers comes from the registered
@@ -716,10 +737,14 @@ class MarshalModule:
         session = self._ctx.session_manager.get_or_create(scratch_key)
         try:
             session.set_tokens(list(real_prompt))
-            chunk_hashes = [
-                TokenHasher.hash_to_bytes(h)
-                for h in session.get_hashes(0, len(real_prompt))
-            ]
+            # get_hashes(0) (end=None) auto-rounds to the last full-chunk
+            # boundary, so an UNALIGNED real_prompt yields a chunk-aligned
+            # prefix instead of asserting on `end % chunk_size == 0` (the
+            # explicit-end convention, session.py). The unaligned tail is
+            # excluded here and rides the proxy's forwarded suffix; the
+            # ipc_key's `end` stays the full length but is inert (the obj
+            # keys derive only from chunk_hashes).
+            chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
             # IPCCacheEngineKey.worker_id is the TP rank, matching what the
             # worker adapter used when STOREing this shard (see
             # vllm_multi_process_adapter.py::_create_key).
@@ -822,8 +847,8 @@ class MarshalModule:
         worker_id: int,
         wait_timeout_ms: int,
     ) -> str:
-        """Block until ``token_ids[0:end_offset]``'s last chunk is
-        committed and readable on every TP rank, or timeout.
+        """Block until ``token_ids``'s last committed chunk is committed
+        and readable on every TP rank, or timeout.
 
         Only the trailing chunk hash is waited on; it is expanded
         across all TP ranks (worker_id=None) since each rank stores
@@ -832,9 +857,14 @@ class MarshalModule:
 
         Args:
             token_ids: Running real prompt (prompt + decoded so far).
-            end_offset: Length of the running prompt; the handler
-                hashes ``[0:end_offset]`` and waits on the trailing
-                chunk_hash.
+            end_offset: Length of the running prompt. Carried on the
+                ipc_key (inert for chunk math); the trailing-chunk hash
+                is derived via ``get_hashes(0)``, which auto-rounds
+                ``token_ids`` to its last full-chunk boundary, so an
+                unaligned running length no longer asserts. The proxy
+                passes ``end_offset == len(token_ids)``, and only calls
+                WAIT_STORE when a full chunk has just committed, so the
+                rounded hash list is always non-empty.
             worker_id: GPU instance ID; used to look up the registered
                 context to get model_name + world_size.
             wait_timeout_ms: ``event.wait`` deadline in milliseconds.
@@ -857,9 +887,13 @@ class MarshalModule:
         session = self._ctx.session_manager.get_or_create(session_key)
         try:
             session.set_tokens(list(token_ids))
-            chunk_hashes = [
-                TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0, end_offset)
-            ]
+            # get_hashes(0) (end=None) auto-rounds to the last full-chunk
+            # boundary of token_ids. The proxy passes end_offset ==
+            # len(token_ids) (the running prompt), so this waits on exactly
+            # the last COMMITTED chunk — an unaligned running length no
+            # longer asserts on `end % chunk_size == 0`. end_offset stays in
+            # the signature for the ipc_key below (inert for chunk math).
+            chunk_hashes = [TokenHasher.hash_to_bytes(h) for h in session.get_hashes(0)]
             target_hash = chunk_hashes[-1]  # only the trailing chunk
 
             # Cross-rank expansion: worker_id=None makes
