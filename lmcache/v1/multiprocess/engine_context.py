@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     # constructs it (register_kv_cache, the sole writer, builds it).
     # MarshalWorkspace is kept type-only so importing engine_context (which
     # EVERY MP server does, including non-GPU/non-tunnel ones) does NOT pull
-    # in kvtunnel.marshal.pack (and torch) at runtime — only MarshalModule,
+    # in kvtunnel.wire.pack (and torch) at runtime — only MarshalModule,
     # the sole constructor, imports it for real.
     from lmcache.v1.multiprocess.marshal_workspace import MarshalWorkspace
     from lmcache.v1.multiprocess.modules.gpu_transfer import GPUContextEntry

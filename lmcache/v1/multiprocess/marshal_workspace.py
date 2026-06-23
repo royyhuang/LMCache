@@ -17,7 +17,7 @@ import os
 import resource
 import threading
 
-from kvtunnel.marshal.pack import TunneledRequestMetadata
+from kvtunnel.wire.header import TunneledRequestMetadata
 
 # First Party
 from lmcache import torch_dev

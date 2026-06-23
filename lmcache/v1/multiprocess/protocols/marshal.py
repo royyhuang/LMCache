@@ -15,7 +15,7 @@ engine protocol free of kvtunnel additions and minimizing merge conflicts.
 """
 
 # First Party
-from kvtunnel.marshal.pack import TunneledRequestMetadata
+from kvtunnel.wire.header import TunneledRequestMetadata
 
 from lmcache.v1.multiprocess.protocols.base import HandlerType, ProtocolDefinition
 
@@ -42,7 +42,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         # Payload:
         #   - marshal_handle: str - rendezvous key for the workspace entry
         #   - real_prompt: list[int] - token IDs of the real prompt
-        #   - method_params: dict - method-specific params (num_sinks,
+        #   - extra_params: dict - method-specific params (num_sinks,
         #       window_size, cache_salt); current impl hardcodes StreamingLLM
         #   - worker_id: int - GPU instance ID whose KV cache holds the prompt
         # Returns: tuple[bool, int, str,
@@ -50,7 +50,7 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
         #   (success, num_fake, error_message, tunneled_request_per_rank,
         #   matched_prefix_len).
         #   On success, error_message == "" and tunneled_request_per_rank
-        #   maps tp_rank -> the per-layer TunneledInfo manifest the connector
+        #   maps tp_rank -> the per-layer TunneledLayerMetadata manifest the connector
         #   stages on the scheduler so workers can build attention metadata
         #   without re-parsing block bytes. num_fake is the number of fake
         #   slots the marshalled blob occupies, 0 on failure (manifest is {}).

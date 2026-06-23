@@ -8,7 +8,7 @@ import base64
 import enum
 
 # Third Party
-from kvtunnel.marshal.pack import TunneledRequestMetadata
+from kvtunnel.wire.header import TunneledRequestMetadata
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
