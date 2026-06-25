@@ -193,6 +193,11 @@ class MarshalModule:
                 )
             world_size = entry.world_size
             use_stub = os.environ.get("KVTUNNEL_STUB_MARSHAL") == "1"
+            # Non-stub marshal method (a string, not a bool flag): selects
+            # the Packer for the real reuse path. ``streaming_llm`` (default,
+            # token drop) or ``packed_fp8`` (fp8 2:1 slot-count packing). The
+            # stub byte-copy path above is orthogonal to this.
+            marshal_method = os.environ.get("KVTUNNEL_MARSHAL_METHOD", "streaming_llm")
 
             # Always published in GPU mode (the only mode MARSHAL runs in);
             # the check is for type-narrowing.
@@ -363,7 +368,7 @@ class MarshalModule:
                             is_mla=gpu_ctx.is_mla,
                             extra_params=extra_params,
                         )
-                        packed_list, manifest = get_packer("streaming_llm").pack(req)
+                        packed_list, manifest = get_packer(marshal_method).pack(req)
                         num_fake = manifest.per_layer[0].num_fake_marshalled
                         logger.info(
                             "[kvtunnel CB] real-pack returned tp_rank=%d "
