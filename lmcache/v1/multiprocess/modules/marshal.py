@@ -19,6 +19,7 @@ Reaches all shared state through ctx seams, so it depends only on
 from contextlib import contextmanager
 from typing import Iterator
 import os
+import threading
 import uuid
 
 from kvtunnel.wire.header import (
@@ -57,6 +58,16 @@ logger = init_logger(__name__)
 # passthrough over a 503. Qualifiers may be APPENDED, but the prefix must
 # never be reworded.
 _L1_MISS_MSG = "unmarshalled KV not fully cached in L1"
+
+# Serialize the heavy pack across MARSHAL handler threads. A packing method
+# (e.g. packed_fp8) quantizes the FULL matched prefix on the CPU and is
+# memory-bandwidth-bound, so running many concurrently only thrashes: 16-way
+# measures ~90s vs ~1-2s solo, tripping the proxy's 60s marshal timeout and
+# starving the heartbeat ping (MARSHAL shares the NORMAL pool). Parallelism
+# buys no speedup here, so one-at-a-time keeps each pack at solo speed and the
+# burst drains in N x solo. RETRIEVE/PING live on other pools, unaffected;
+# streaming_llm's window-select pack is sub-ms so the lock stays uncontended.
+_PACK_LOCK = threading.Lock()
 
 
 class MarshalModule:
@@ -378,7 +389,10 @@ class MarshalModule:
                             is_mla=gpu_ctx.is_mla,
                             extra_params=extra_params,
                         )
-                        packed_list, manifest = get_packer(marshal_method).pack(req)
+                        with _PACK_LOCK:
+                            packed_list, manifest = get_packer(
+                                marshal_method
+                            ).pack(req)
                         num_fake = manifest.per_layer[0].num_fake_marshalled
                         logger.info(
                             "[kvtunnel CB] real-pack returned tp_rank=%d "
