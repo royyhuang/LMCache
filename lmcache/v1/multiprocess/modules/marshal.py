@@ -328,9 +328,19 @@ class MarshalModule:
                         # Head geometry validates the chunk's KV_2LTD shape
                         # and fills the header's num_active_heads.
                         shape_desc = gpu_ctx.get_shape_desc(0)
-                        # max_chunks: 2x max_batch_size gives headroom past the
-                        # kernel's 4-chunk-per-call cap (mp_mem_kernels.cu).
-                        max_chunks = max(8, gpu_ctx.max_batch_size * 2)
+                        # max_chunks caps the packed-blob chunk count. A
+                        # packing method (packed_fp8) keeps ALL matched tokens,
+                        # so its packed prefix spans far more chunks than
+                        # streaming_llm's small retained window — size to cover
+                        # the full matched prefix (the worst case for any
+                        # method) plus headroom, not just the batch size.
+                        chunk_size = self._ctx.chunk_size
+                        prefix_chunks = (
+                            matched_prefix_len + chunk_size - 1
+                        ) // chunk_size
+                        max_chunks = max(
+                            8, gpu_ctx.max_batch_size * 2, prefix_chunks + 2
+                        )
                         logger.info(
                             "[kvtunnel CB] real-pack tp_rank=%d real_prompt_len=%d "
                             "matched_prefix_len=%d "
