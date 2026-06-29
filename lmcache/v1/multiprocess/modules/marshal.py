@@ -16,6 +16,8 @@ Reaches all shared state through ctx seams, so it depends only on
 """
 
 # Standard
+from collections import OrderedDict
+from collections.abc import Mapping
 from contextlib import contextmanager
 from typing import Iterator
 import os
@@ -26,7 +28,7 @@ from kvtunnel.wire.header import (
     MAX_HEADER_BLOCKS,
     TunneledRequestMetadata,
 )
-from kvtunnel.wire.interface import PackRequest
+from kvtunnel.wire.interface import IncrementalState, PackRequest
 from kvtunnel.wire.registry import get_packer
 
 # First Party
@@ -69,6 +71,70 @@ _L1_MISS_MSG = "unmarshalled KV not fully cached in L1"
 # streaming_llm's window-select pack is sub-ms so the lock stays uncontended.
 _PACK_LOCK = threading.Lock()
 
+# Bounded LRU of per-chain pack state for incremental marshalling: one entry
+# per re-tunnel chain, keyed by the cycle's marshal_handle, value maps tp_rank
+# -> the packer's opaque IncrementalState. An incremental packer (packed_fp8)
+# caches its quantized slot tensor here so the next cycle extends instead of
+# re-packing the whole prefix. A live chain holds only its LATEST handle (each
+# cycle supersedes + pops the prior); the cap is purely a host-RAM backstop for
+# aborted chains whose final handle is never superseded. Each entry can be ~GB
+# (a long packed prefix), so keep the cap near max concurrency. MARSHAL_FREE
+# NEVER touches this cache (it frees only the workspace blob) -- supersession
+# + this LRU are the sole eviction paths.
+_CHAIN_CACHE_MAX = int(os.environ.get("KVTUNNEL_CHAIN_CACHE_MAX", "64"))
+
+
+class _ChainCache:
+    """Bounded-LRU per-chain IncrementalState for incremental marshalling.
+
+    Keyed by the cycle's ``marshal_handle``; value maps ``tp_rank`` -> the
+    packer's opaque ``IncrementalState``. Thread-safe across concurrent
+    NORMAL-pool MARSHAL handlers. Eviction is by **supersession**
+    (``store`` drops the prior chain) + a bounded-LRU backstop only;
+    ``MARSHAL_FREE`` never touches it (see ``_CHAIN_CACHE_MAX``).
+    """
+
+    def __init__(self, max_chains: int = _CHAIN_CACHE_MAX) -> None:
+        self._max = max_chains
+        self._lock = threading.Lock()
+        self._cache: OrderedDict[str, dict[int, IncrementalState]] = OrderedDict()
+
+    def get(self, handle: str, tp_rank: int) -> IncrementalState | None:
+        """Cached state for ``(handle, tp_rank)``, or ``None`` (cold/evicted/
+        empty handle). Marks the chain most-recently-used."""
+        if not handle:
+            return None
+        with self._lock:
+            per_rank = self._cache.get(handle)
+            if per_rank is None:
+                return None
+            self._cache.move_to_end(handle)
+            return per_rank.get(tp_rank)
+
+    def store(
+        self,
+        handle: str,
+        extend_from_handle: str,
+        states: Mapping[int, IncrementalState | None],
+    ) -> None:
+        """Cache this cycle's per-rank states + drop the superseded chain.
+
+        ``states`` maps ``tp_rank`` -> state | ``None``; a ``None`` (a
+        non-incremental packer) caches nothing, so a streaming_llm chain
+        never populates the cache. Pops the prior ``extend_from_handle``
+        (supersession) and LRU-evicts to ``_max``.
+        """
+        live = {r: s for r, s in states.items() if s is not None}
+        if not live:
+            return
+        with self._lock:
+            if extend_from_handle:
+                self._cache.pop(extend_from_handle, None)
+            self._cache[handle] = live
+            self._cache.move_to_end(handle)
+            while len(self._cache) > self._max:
+                self._cache.popitem(last=False)
+
 
 class MarshalModule:
     """Handles KV-tunnel MARSHAL operations.
@@ -92,6 +158,9 @@ class MarshalModule:
         # and published on ctx so GPUTransferModule's RETRIEVE delegation
         # reaches it via ``ctx.marshal_workspace``.
         self._ctx.marshal_workspace = MarshalWorkspace(self._ctx)
+
+        # Per-chain incremental-pack state for the extend-marshal path.
+        self._chains = _ChainCache()
 
     @property
     def context(self) -> MPCacheEngineContext:
@@ -196,6 +265,12 @@ class MarshalModule:
             window_size = int(extra_params.get("window_size", 1020))
             cache_salt = str(extra_params.get("cache_salt", ""))
             min_matched_tokens = int(extra_params.get("min_matched_tokens", 0))
+            # Incremental marshalling: the prior cycle's handle, if any. An
+            # incremental packer extends that chain's cached state instead of
+            # re-packing the whole grown prefix; empty = cold/fresh -> full
+            # pack. Per-rank states for this cycle, cached under marshal_handle.
+            extend_from_handle = str(extra_params.get("extend_from_handle", ""))
+            new_states: dict[int, IncrementalState | None] = {}
 
             entry = self._ctx.gpu_context_registry.get(worker_id)
             if entry is None:
@@ -389,16 +464,33 @@ class MarshalModule:
                             is_mla=gpu_ctx.is_mla,
                             extra_params=extra_params,
                         )
+                        # Incremental: extend this rank's cached chain when it
+                        # has prior state and the packer supports it; else a
+                        # full pack that ALSO seeds the chain. pack_extend
+                        # self-falls-back to a full pack on a non-clean delta,
+                        # and both paths yield the same num_fake for this
+                        # matched_prefix_len, so a per-rank mix is safe.
+                        packer = get_packer(marshal_method)
+                        prev_state = self._chains.get(extend_from_handle, tp_rank)
                         with _PACK_LOCK:
-                            packed_list, manifest = get_packer(
-                                marshal_method
-                            ).pack(req)
+                            if prev_state is not None and packer.supports_incremental:
+                                did_extend = True
+                                packed_list, manifest, new_state = packer.pack_extend(
+                                    req, prev_state
+                                )
+                            else:
+                                did_extend = False
+                                packed_list, manifest, new_state = packer.pack_initial(
+                                    req
+                                )
+                        new_states[tp_rank] = new_state
                         num_fake = manifest.per_layer[0].num_fake_marshalled
                         logger.info(
                             "[kvtunnel CB] real-pack returned tp_rank=%d "
-                            "num_fake=%d k=%d blob_logical_shape=%s "
+                            "extend=%s num_fake=%d k=%d blob_logical_shape=%s "
                             "blob_dtype=%s blob_nbytes=%d",
                             tp_rank,
+                            did_extend,
                             num_fake,
                             len(packed_list),
                             tuple(packed_list[0].meta.shape),
@@ -431,6 +523,10 @@ class MarshalModule:
                 WorkspaceEntry(mem_objs_per_rank=per_rank, instance_id=worker_id),
             )
             published = True
+            # Cache this cycle's chain state (supersedes extend_from_handle);
+            # only after a successful publish, so a mid-loop failure leaves no
+            # stale entry. No-op for a non-incremental packer (None states).
+            self._chains.store(marshal_handle, extend_from_handle, new_states)
             logger.info(
                 "MARSHAL handle=%s real_tokens=%d matched_prefix=%d "
                 "num_fake=%d ranks=%d%s",
