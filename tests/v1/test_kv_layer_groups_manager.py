@@ -237,3 +237,43 @@ class TestFormatKvcacheShapeSpec:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestCompressRatio:
+    """compress_ratio=2 registration (packed-at-write, Phase 3): a
+    layout_hints ie_logical_block_size of 2x the tensor block dim makes
+    the group compressed — half-cadence blocks-per-chunk and half-slot
+    physical chunk size derive from the existing machinery."""
+
+    def test_double_ie_bs_gives_ratio_two(self):
+        # First Party
+        import lmcache.c_ops as lmc_ops
+
+        bs = 16
+        tensors = [torch.randn(2, 8, bs, 4, 32, dtype=torch.bfloat16)]
+        manager = KVLayerGroupsManager(
+            tensors,
+            gpu_kv_format=lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+            num_blocks=8,
+            lmcache_logical_chunk_size=64,
+            layout_hints={"inference_engine_logical_block_size": 2 * bs},
+        )
+        group = manager.kv_layer_groups[0]
+        assert group.compress_ratio == 2
+        assert group.physical_chunk_size == 32  # 64 logical / 2
+        assert manager.inference_engine_logical_block_size == 2 * bs
+
+    def test_indivisible_chunk_raises(self):
+        # First Party
+        import lmcache.c_ops as lmc_ops
+
+        bs = 16
+        tensors = [torch.randn(2, 8, bs, 4, 32, dtype=torch.bfloat16)]
+        with pytest.raises(ValueError):
+            KVLayerGroupsManager(
+                tensors,
+                gpu_kv_format=lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+                num_blocks=8,
+                lmcache_logical_chunk_size=33,  # not divisible by 2
+                layout_hints={"inference_engine_logical_block_size": 2 * bs},
+            )

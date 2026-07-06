@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import base64
 import enum
+import os
 
 # Third Party
 from kvtunnel.wire.header import TunneledRequestMetadata
@@ -21,6 +22,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import RequestStatus
 from vllm.v1.utils import ConstantList
 import msgspec
+
 import torch
 import zmq
 
@@ -78,6 +80,15 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = lmcache_init_logger(__name__)
+
+# Packed-at-write deployment (kvtunnel packed_fp8): the engine cache
+# holds 2 fp8 tokens per bf16 slot, so the LMCache server consumes
+# block ids at HALF cadence (compress_ratio=2, chunk//(2*blk) ids per
+# chunk). Store windows must be derived from the real-chain token
+# offsets, and the non-tunnel (lookup-hit) retrieve is disabled — its
+# full-cadence window would scatter past the packed data; the marshal
+# path is the only packed reader (plan/feat/packed-at-write Phase 3).
+_PACKED_DEPLOY: bool = os.environ.get("KVTUNNEL_MARSHAL_METHOD") == "packed_fp8"
 
 
 # Helper functions
@@ -466,6 +477,15 @@ class LMCacheMPRequestMetadata:
                 # real prefix (`len(real_token_ids)`).
                 real_chain_start = len(real_token_ids) + (start_token_idx - num_fake)
                 real_chain_end = real_chain_start + (end_token_idx - start_token_idx)
+                if _PACKED_DEPLOY:
+                    # Half-cadence window over the packed data: chunk
+                    # k's real tokens live in blocks
+                    # [k*chunk//(2*blk), ...). Chunk-aligned chain
+                    # offsets divide 2*blk evenly.
+                    bs2 = 2 * vllm_block_size
+                    w0 = real_chain_start // bs2
+                    w1 = (real_chain_end + bs2 - 1) // bs2
+                    block_ids = tracker.allocated_block_ids[w0:w1]
                 op = LoadStoreOp(
                     token_ids=substituted_token_ids,
                     block_ids=block_ids,
@@ -474,6 +494,13 @@ class LMCacheMPRequestMetadata:
                 )
             else:
                 token_ids = list(tracker.all_token_ids)
+                if _PACKED_DEPLOY:
+                    # Cold rows write packed into the FIRST half of
+                    # their allocation; same half-cadence window.
+                    bs2 = 2 * vllm_block_size
+                    w0 = start_token_idx // bs2
+                    w1 = (end_token_idx + bs2 - 1) // bs2
+                    block_ids = tracker.allocated_block_ids[w0:w1]
                 op = LoadStoreOp(
                     token_ids=token_ids,
                     block_ids=block_ids,
@@ -515,6 +542,10 @@ class LMCacheMPRequestMetadata:
         kv_params = tracker.kv_transfer_params
         if kv_params and kv_params.get("kv_tunnel_mvp"):
             num_fake = int(kv_params["num_fake"])
+            # num_fake is the packed half-slot count (pack_stored), so it
+            # maps 1:1 to the fake token-slots vLLM allocated; the
+            # RETRIEVE fills exactly num_fake // block_size blocks (= the
+            # compress_ratio=2 scatter's k * blocks_per_chunk).
             num_blocks_needed = (num_fake + vllm_block_size - 1) // vllm_block_size
             op = LoadStoreOp(
                 block_ids=tracker.allocated_block_ids[:num_blocks_needed],
@@ -1053,6 +1084,12 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             # below) is unreached because we `return` here.
             tracker.increase_num_stored_blocks(num_fake // self.vllm_block_size)
             return num_fake, True
+
+        if _PACKED_DEPLOY:
+            # Packed deployment: the stock lookup-hit retrieve window is
+            # full-cadence and would scatter past the packed data; the
+            # marshal path is the only packed reader. Report a miss.
+            return 0, False
 
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,

@@ -16,8 +16,8 @@ Reaches all shared state through ctx seams, so it depends only on
 """
 
 # Standard
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Iterator
 import os
 import threading
 import uuid
@@ -27,6 +27,7 @@ from kvtunnel.wire.header import (
     TunneledRequestMetadata,
 )
 from kvtunnel.wire.interface import PackRequest
+from kvtunnel.wire.packed_fp8.pack import pack_stored, stored_chunk_views
 from kvtunnel.wire.registry import get_packer
 
 # First Party
@@ -59,14 +60,17 @@ logger = init_logger(__name__)
 # never be reworded.
 _L1_MISS_MSG = "unmarshalled KV not fully cached in L1"
 
-# Serialize the heavy pack across MARSHAL handler threads. A packing method
-# (e.g. packed_fp8) quantizes the FULL matched prefix on the CPU and is
-# memory-bandwidth-bound, so running many concurrently only thrashes: 16-way
-# measures ~90s vs ~1-2s solo, tripping the proxy's 60s marshal timeout and
-# starving the heartbeat ping (MARSHAL shares the NORMAL pool). Parallelism
-# buys no speedup here, so one-at-a-time keeps each pack at solo speed and the
-# burst drains in N x solo. RETRIEVE/PING live on other pools, unaffected;
-# streaming_llm's window-select pack is sub-ms so the lock stays uncontended.
+# Serialize the pack/emit across MARSHAL handler threads: both the legacy
+# CPU quantize (any non-packed_fp8 method with a heavy pack) and the
+# packed_fp8 stored-read emit (a pinned-pool memcpy) are memory-bandwidth-
+# bound, so running many concurrently only thrashes — the historical
+# CPU-quantize measurement was ~90s at 16-way vs ~1-2s solo, tripping the
+# proxy's 60s marshal timeout and starving the heartbeat ping (MARSHAL
+# shares the NORMAL pool). One-at-a-time keeps each pack at solo speed and
+# the burst drains in N x solo; for packed_fp8's ~ms emit the serialized
+# drain is negligible. RETRIEVE/PING live on other pools, unaffected;
+# streaming_llm's window-select pack is sub-ms so the lock stays
+# uncontended.
 _PACK_LOCK = threading.Lock()
 
 
@@ -222,9 +226,19 @@ class MarshalModule:
             ie_block_size = kvlgm.inference_engine_logical_block_size
             # At/below this StreamingLLM retains ~the whole prefix, so
             # num_fake > matched + header and the pack crashes on delta<0.
-            compression_floor = (
-                num_sinks + window_size + MAX_HEADER_BLOCKS * ie_block_size
-            )
+            # The sinks/window/header floor is streaming_llm semantics
+            # (a window >= matched means nothing to compress). packed_fp8
+            # has no sinks, window, or header — its 2:1 slot compression
+            # applies to ANY matched prefix, so its only floor is the
+            # caller's min_matched_tokens. (Also load-bearing under
+            # compress_ratio=2: the doubled ie_block_size would inflate
+            # this floor past short prompts.)
+            if marshal_method == "packed_fp8":
+                compression_floor = 0
+            else:
+                compression_floor = (
+                    num_sinks + window_size + MAX_HEADER_BLOCKS * ie_block_size
+                )
 
             # require_full (ask >= full len): cap at aligned_total so an
             # unaligned tail can't force a miss. Fractional asks stay raw.
@@ -284,11 +298,12 @@ class MarshalModule:
                     cache_salt=cache_salt,
                     marshal_handle=marshal_handle,
                     limit_chunks=limit_chunks,
-                ) as mem_objs:
-                    if mem_objs is None:
+                ) as fetched:
+                    if fetched is None:
                         # No chunk in L1 -> clean miss (proxy passthrough).
                         _free_packed()
                         return (False, 0, _L1_MISS_MSG, {}, 0)
+                    mem_objs, matched_keys = fetched
                     matched_chunks = len(mem_objs)
                     matched_prefix_len = matched_chunks * self._ctx.chunk_size
                     if limit_chunks > 0 and matched_chunks != limit_chunks:
@@ -372,27 +387,51 @@ class MarshalModule:
                             gpu_ctx.kv_layer_groups_manager.num_groups,
                             gpu_ctx.is_mla,
                         )
-                        # real_prompt_len = matched (not full): anchors the
-                        # window and delta so the forwarded suffix RoPEs at
-                        # matched_prefix_len..
-                        req = PackRequest(
-                            workspace_allocator=workspace_allocator,
-                            orig_kv_obj=mem_objs,
-                            chunk_size=self._ctx.chunk_size,
-                            num_layers=gpu_ctx.num_layers,
-                            block_size=ie_block_size,
-                            real_prompt_len=matched_prefix_len,
-                            num_kv_heads=shape_desc.nh,
-                            head_size=shape_desc.hs,
-                            max_chunks=max_chunks,
-                            num_groups=gpu_ctx.kv_layer_groups_manager.num_groups,
-                            is_mla=gpu_ctx.is_mla,
-                            extra_params=extra_params,
-                        )
-                        with _PACK_LOCK:
-                            packed_list, manifest = get_packer(
-                                marshal_method
-                            ).pack(req)
+                        if marshal_method == "packed_fp8":
+                            # Store-time-packed chunks: no quantize here —
+                            # the packed-READ re-chunks bytes + rebuilds
+                            # the manifest (fixed scale 1.0).
+                            result = self._pack_stored_packed_fp8(
+                                mem_objs=mem_objs,
+                                matched_keys=matched_keys,
+                                workspace_allocator=workspace_allocator,
+                                num_layers=gpu_ctx.num_layers,
+                                hidden=shape_desc.nh * shape_desc.hs,
+                                max_chunks=max_chunks,
+                            )
+                            if result is None:
+                                _free_packed()
+                                return (
+                                    False,
+                                    0,
+                                    _L1_MISS_MSG + " (stored-packed chunks"
+                                    " unreadable: scale or shape mismatch)",
+                                    {},
+                                    0,
+                                )
+                            packed_list, manifest = result
+                        else:
+                            # real_prompt_len = matched (not full): anchors
+                            # the window and delta so the forwarded suffix
+                            # RoPEs at matched_prefix_len..
+                            req = PackRequest(
+                                workspace_allocator=workspace_allocator,
+                                orig_kv_obj=mem_objs,
+                                chunk_size=self._ctx.chunk_size,
+                                num_layers=gpu_ctx.num_layers,
+                                block_size=ie_block_size,
+                                real_prompt_len=matched_prefix_len,
+                                num_kv_heads=shape_desc.nh,
+                                head_size=shape_desc.hs,
+                                max_chunks=max_chunks,
+                                num_groups=(gpu_ctx.kv_layer_groups_manager.num_groups),
+                                is_mla=gpu_ctx.is_mla,
+                                extra_params=extra_params,
+                            )
+                            with _PACK_LOCK:
+                                packed_list, manifest = get_packer(marshal_method).pack(
+                                    req
+                                )
                         num_fake = manifest.per_layer[0].num_fake_marshalled
                         logger.info(
                             "[kvtunnel CB] real-pack returned tp_rank=%d "
@@ -456,6 +495,65 @@ class MarshalModule:
                 _free_packed()
             return (False, 0, str(exc), {}, 0)
 
+    def _pack_stored_packed_fp8(
+        self,
+        mem_objs: list[MemoryObj],
+        matched_keys: list[ObjectKey],
+        workspace_allocator,
+        num_layers: int,
+        hidden: int,
+        max_chunks: int,
+    ) -> tuple[list[MemoryObj], TunneledRequestMetadata] | None:
+        """The packed_fp8 marshal packed-READ, or ``None`` for a clean miss.
+
+        Under packed-at-write the chunks were quantized + slot-packed by
+        the WRITE KERNEL (scale fixed 1.0) and stored verbatim as
+        half-slot chunks by the compress_ratio=2 store, so this only
+        validates the packed shape and copies each L1 chunk byte-verbatim
+        into a half-slot workspace chunk (``pack_stored``). ``None``
+        (clean cache miss -> proxy passthrough, never a 503) when any
+        chunk isn't packed-shaped. ``matched_keys`` is kept for the
+        fetch contract but no longer consulted (the fixed 1.0 scale needs
+        no per-key lookup).
+
+        Args:
+            mem_objs: Matched L1 chunks (read-locked by the caller).
+            matched_keys: Their object keys (unused).
+            workspace_allocator: The kvtunnel workspace allocator.
+            num_layers: Decoder layer count.
+            hidden: ``num_kv_heads * head_size``.
+            max_chunks: Cap on workspace chunks.
+
+        Returns:
+            ``(chunks, manifest)`` like ``Packer.pack``, or ``None``.
+        """
+        del matched_keys  # fetch-contract arg; fixed-1.0 scale needs no key
+        views = stored_chunk_views(mem_objs, num_layers, self._ctx.chunk_size, hidden)
+        if views is None:
+            logger.warning(
+                "packed_fp8 marshal: matched L1 chunks are not "
+                "packed-shaped (half-slot) -> miss"
+            )
+            return None
+        # _PACK_LOCK still serializes the emit: it is a memory-bandwidth-
+        # bound host copy, same contention class as the packs it guards.
+        with _PACK_LOCK:
+            packed_list, manifest = pack_stored(
+                workspace_allocator,
+                views,
+                self._ctx.chunk_size,
+                num_layers,
+                hidden,
+                max_chunks,
+            )
+        logger.info(
+            "[kvtunnel CB] packed-read tp-chunks=%d k=%d num_fake=%d",
+            len(views),
+            len(packed_list),
+            manifest.per_layer[0].num_fake_marshalled,
+        )
+        return packed_list, manifest
+
     @contextmanager
     def _fetch_unmarshalled_for_marshal(
         self,
@@ -466,9 +564,11 @@ class MarshalModule:
         *,
         marshal_handle: str,
         limit_chunks: int = 0,
-    ) -> Iterator[list[MemoryObj] | None]:
-        """Context manager: yield the unmarshalled KV chunks for one TP
-        rank of ``real_prompt`` while holding their L1 read lock.
+    ) -> Iterator[tuple[list[MemoryObj], list[ObjectKey]] | None]:
+        """Context manager: yield ``(chunks, matched_keys)`` for one TP
+        rank of ``real_prompt`` while holding their L1 read lock —
+        ``matched_keys`` is the capped key list the chunks were read
+        under (the packed-READ's fetch contract).
 
         Args:
             real_prompt: Token IDs of the real prompt.
@@ -559,7 +659,7 @@ class MarshalModule:
                 # tensors (sync CPU slice-assign), so once it returns the
                 # source is fully copied and the lock releases eagerly (no
                 # stream deferral, unlike the async-H2D retrieve path).
-                yield list(mem_objs)
+                yield (list(mem_objs), matched_keys)
                 # Reached only if the with-body didn't raise: release the
                 # read lock for exactly the truncated prefix. Success-path
                 # only — read_prefetched_results' finally covers miss/raise.

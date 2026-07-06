@@ -32,6 +32,11 @@ from lmcache.v1.periodic_thread import PeriodicThread, ThreadLevel, ThreadRunSum
 
 logger = init_logger(__name__)
 
+# packed-at-write deployment: the engine cache holds 2 fp8 tokens
+# per bf16 slot, so report a doubled logical block size ->
+# compress_ratio=2 in the group manager (kvtunnel packed_fp8).
+_PACKED_DEPLOY: bool = os.environ.get("KVTUNNEL_MARSHAL_METHOD") == "packed_fp8"
+
 
 class ExtraConfigDefault(enum.Enum):
     """Centralized default values for extra_config keys.
@@ -989,9 +994,18 @@ class LMCacheMPWorkerAdapter:
         self.kv_caches = kv_caches
         self.transfer_ctx = create_transfer_context(kv_caches)
         layout_hints = vllm_layout_hints()
-        layout_hints["inference_engine_logical_block_size"] = (
-            self.vllm_logical_block_size
-        )
+        # Packed-at-write deployment (kvtunnel packed_fp8): the engine's
+        # bf16 block of ``blk`` slots holds ``2 * blk`` fp8 tokens, so
+        # report the LOGICAL tokens-per-block as doubled. The server's
+        # group manager derives ``compress_ratio = ie_bs // slots = 2``
+        # from it, which halves the store's blocks-per-chunk cadence and
+        # the L1 layout to half-slot chunks (kv_layer_groups.py
+        # compress_ratio derivation) — the existing compressed-group
+        # machinery carries the whole packed store geometry.
+        ie_bs = self.vllm_logical_block_size
+        if _PACKED_DEPLOY:
+            ie_bs = 2 * ie_bs
+        layout_hints["inference_engine_logical_block_size"] = ie_bs
         try:
             self.transfer_ctx.register(
                 self.instance_id,

@@ -7,6 +7,9 @@ from itertools import islice
 from typing import Generator
 import time
 
+# Third Party
+import torch
+
 # First Party
 from lmcache import torch_dev, torch_device_type
 from lmcache.logging import init_logger
@@ -403,51 +406,19 @@ class GPUTransferModule:
 
             reserved_dict: dict[ObjectKey, MemoryObj] = {}
             try:
-                layout_desc = get_layout_desc(gpu_context, self._ctx.chunk_size)
-                reserved_dict = self._ctx.storage_manager.reserve_write(
-                    obj_keys, layout_desc, "new"
+                # Packed-at-write: engine bytes are ALREADY packed, so
+                # the stock engine-geometry gather is the packed store —
+                # compress_ratio=2 (registered via the adapter's
+                # layout_hints) halves blocks_per_chunk and the L1
+                # layout to half-slot chunks. The store-time quantize
+                # pass died with plan/feat/packed-at-write Phase 3.
+                self._store_engine_geometry(
+                    gpu_context,
+                    obj_keys,
+                    all_block_ids_gpu,
+                    blocks_per_chunk,
+                    reserved_dict,
                 )
-
-                # NOTE: Store is not batched because some obj_keys may be
-                # skipped (not in reserved_dict), making block_ids
-                # non-contiguous. Batching would require torch.cat to
-                # reassemble block_ids, negating the benefit.
-                num_groups = gpu_context.kv_layer_groups_manager.num_groups
-                for idx, obj_key in enumerate(obj_keys):
-                    if obj_key in reserved_dict:
-                        memory_obj = reserved_dict[obj_key]
-                    else:
-                        continue
-
-                    chunk_block_ids_gpu = all_block_ids_gpu[
-                        idx * blocks_per_chunk : (idx + 1) * blocks_per_chunk
-                    ]
-
-                    # Copy from GPU paged buffer to tmp buffer, then to CPU — per group
-                    for group_idx in range(num_groups):
-                        tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
-                        group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
-                        # Kernel contract: ``group_lmcache_chunk_size`` here is the
-                        # number of *physical* slots per chunk for this group
-                        # (= logical chunk_size // compress_ratio).
-                        group_lmcache_chunk_size = gpu_context.get_physical_chunk_size(
-                            group_idx
-                        )
-                        lmc_ops.multi_layer_block_kv_transfer(
-                            group_kv_pointers,
-                            [tmp_buffer.data_ptr()],
-                            chunk_block_ids_gpu,
-                            gpu_context.device,
-                            lmc_ops.TransferDirection.D2H,
-                            gpu_context.get_shape_desc(group_idx),
-                            group_lmcache_chunk_size,
-                            gpu_context.gpu_kv_format_,
-                            0,
-                        )
-                    # Store is not batched, so we always use chunk_idx=0 (single slot)
-                    lmcache_memcpy_async_d2h(
-                        gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
-                    )
             except Exception:
                 logger.exception("Cannot store keys due to exception")
             finally:
@@ -488,6 +459,73 @@ class GPUTransferModule:
                 ed - st,
             )
         return event.ipc_handle(), True
+
+    def _store_engine_geometry(
+        self,
+        gpu_context: GPUCacheContext,
+        obj_keys: list[ObjectKey],
+        all_block_ids_gpu: torch.Tensor,
+        blocks_per_chunk: int,
+        reserved_dict: dict[ObjectKey, MemoryObj],
+    ) -> None:
+        """The stock store: gather at engine geometry and D2H raw bytes.
+
+        Verbatim extraction of the pre-packed_fp8 store loop. Populates
+        ``reserved_dict`` in place — the caller's ``finally`` finish-writes
+        those keys.
+
+        Args:
+            gpu_context: The registered GPU context to gather from.
+            obj_keys: Chunk object keys for the RPC's ``[start, end)``.
+            all_block_ids_gpu: Staged GPU block ids covering ``obj_keys``.
+            blocks_per_chunk: Engine blocks per lmcache chunk.
+            reserved_dict: Output map of reserved keys -> L1 objects.
+        """
+        layout_desc = get_layout_desc(gpu_context, self._ctx.chunk_size)
+        reserved_dict.update(
+            self._ctx.storage_manager.reserve_write(obj_keys, layout_desc, "new")
+        )
+
+        # NOTE: Store is not batched because some obj_keys may be
+        # skipped (not in reserved_dict), making block_ids
+        # non-contiguous. Batching would require torch.cat to
+        # reassemble block_ids, negating the benefit.
+        num_groups = gpu_context.kv_layer_groups_manager.num_groups
+        for idx, obj_key in enumerate(obj_keys):
+            if obj_key in reserved_dict:
+                memory_obj = reserved_dict[obj_key]
+            else:
+                continue
+
+            chunk_block_ids_gpu = all_block_ids_gpu[
+                idx * blocks_per_chunk : (idx + 1) * blocks_per_chunk
+            ]
+
+            # Copy from GPU paged buffer to tmp buffer, then to CPU — per group
+            for group_idx in range(num_groups):
+                tmp_buffer = gpu_context.get_tmp_chunk_gpu_buffer(group_idx)
+                group_kv_pointers = gpu_context.get_group_kv_pointers(group_idx)
+                # Kernel contract: ``group_lmcache_chunk_size`` here is the
+                # number of *physical* slots per chunk for this group
+                # (= logical chunk_size // compress_ratio).
+                group_lmcache_chunk_size = gpu_context.get_physical_chunk_size(
+                    group_idx
+                )
+                lmc_ops.multi_layer_block_kv_transfer(
+                    group_kv_pointers,
+                    [tmp_buffer.data_ptr()],
+                    chunk_block_ids_gpu,
+                    gpu_context.device,
+                    lmc_ops.TransferDirection.D2H,
+                    gpu_context.get_shape_desc(group_idx),
+                    group_lmcache_chunk_size,
+                    gpu_context.gpu_kv_format_,
+                    0,
+                )
+            # Store is not batched, so we always use chunk_idx=0 (single slot)
+            lmcache_memcpy_async_d2h(
+                gpu_context.get_tmp_gpu_buffer_flat(chunk_idx=0), memory_obj
+            )
 
     @_lmcache_nvtx_annotate
     def retrieve(
