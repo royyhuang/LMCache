@@ -774,7 +774,7 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         picked for this rank out of the per-rank dict on
         ``LMCacheMPConnectorMetadata.tunneled_manifests`` (keyed by
         ``first_block_id``). The ``KVTunnelMetadataBuilder`` reads it via
-        ``tunnel_registry.get(block_table_tensor[req_idx, 0])``.
+        ``host_meta.get(block_table_tensor[req_idx, 0])``.
 
         Replace (not merge), incl. clearing on a tunnel-free step, so a
         finished request's ``first_block_id`` is pruned every step and a
@@ -800,14 +800,14 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             # serve untunneled requests.
             return
         self._tunnel_seen = True
-        # Local import: tunnel_registry lives under kvtunnel/, which is
+        # Local import: host_meta lives under kvtunnel/, which is
         # NOT importable until the kvtunnel plugin registers.
-        from kvtunnel.integration import tunnel_registry
+        from kvtunnel.integration import host_meta
 
         # REPLACE with this step's full in-flight set (empty dict clears
         # the registry on a tunnel-free step). _build_registry_snapshot
         # picks this rank's manifest per first_block_id.
-        tunnel_registry.replace_snapshot(self._build_registry_snapshot(manifests))
+        host_meta.replace_snapshot(self._build_registry_snapshot(manifests))
 
     def _build_registry_snapshot(
         self,
