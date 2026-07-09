@@ -623,9 +623,12 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         # first_block_id (the GPU paged-cache block holding chunk 0
         # of the marshalled blob, allocated uniquely by KVCacheManager
         # and stable for the request's lifetime) to its per-rank
-        # manifest dict. The worker rebuilds its registry from this
-        # dict every step (atomic replace), so requests absent here
-        # are dropped automatically.
+        # manifest dict, for every SCHEDULED tunneled request this step
+        # (unscheduled — preempted/waiting — requests are filtered out:
+        # their freed first block may already be reallocated, and
+        # emitting them would revive a stale key). The worker rebuilds
+        # its registry from this dict every step (atomic replace), so
+        # requests absent here are dropped automatically.
         #
         # Keying by first_block_id (rather than request_id) lets the
         # builder do a single batched ``block_table_tensor[:num_reqs,
@@ -719,6 +722,9 @@ class LMCacheMPConnector(KVConnectorBase_V1):
             # first_block_id can't linger) WITHOUT importing kvtunnel in a
             # pure-vLLM / stock-LMCache deployment that never tunnels.
             self._tunnel_seen = False
+            # Deployment-method unpacker for the device metadata table,
+            # resolved lazily on first tunnel sight (same import guard).
+            self._tunnel_unpacker = None
         else:
             raise ValueError(f"Unknown KVConnectorRole: {self.role}")
 
@@ -770,8 +776,10 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         require any vLLM core changes.
 
         Atomically REPLACES the worker-local registry with this step's
-        snapshot — the manifest for every in-flight tunneled request,
-        picked for this rank out of the per-rank dict on
+        snapshot — the manifest for every SCHEDULED tunneled request
+        (the scheduler-side staging filters to the scheduled set — see
+        ``_stage_tunneled_manifests``), picked for this rank out of the
+        per-rank dict on
         ``LMCacheMPConnectorMetadata.tunneled_manifests`` (keyed by
         ``first_block_id``). The ``KVTunnelMetadataBuilder`` reads it via
         ``host_meta.get(block_table_tensor[req_idx, 0])``.
@@ -780,9 +788,18 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         finished request's ``first_block_id`` is pruned every step and a
         reused block can't inherit a stale manifest. This is correct
         because the manifest is captured at block allocation
-        (``_capture_tunnel_manifest``), so the per-step snapshot is
-        complete and in-time even for async-KV-load requests at TP>1 —
+        (``_capture_tunnel_manifest``), so a request's first SCHEDULED
+        step emits it — in-time even for async-KV-load requests at TP>1;
         there is no lagged-empty snapshot for a replace to clobber.
+
+        Also syncs the DEVICE metadata table
+        (:mod:`kvtunnel.integration.device_meta`) from the same resolved
+        snapshot — the d2h-free geometry channel for slot-count packing
+        methods (device-meta-table design). Ordering NOTE: correctness
+        (this hook's writes visible to this step's builder gathers)
+        requires the classic-runner hook-before-build order; the
+        deployment pins ``VLLM_USE_V2_MODEL_RUNNER=0`` and the builder
+        asserts it.
 
         Falls back to ``per_rank[0]`` for the rank-invariant single-rank
         case (most common; the pack emits the same manifest for every TP
@@ -804,10 +821,31 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         # NOT importable until the kvtunnel plugin registers.
         from kvtunnel.integration import host_meta
 
-        # REPLACE with this step's full in-flight set (empty dict clears
+        # REPLACE with this step's full scheduled set (empty dict clears
         # the registry on a tunnel-free step). _build_registry_snapshot
         # picks this rank's manifest per first_block_id.
-        host_meta.replace_snapshot(self._build_registry_snapshot(manifests))
+        snapshot = self._build_registry_snapshot(manifests)
+        host_meta.replace_snapshot(snapshot)
+
+        # DEVICE table: same snapshot, same staleness semantics, joined
+        # on-device by the builder (zero d2h). Unpacker resolved once
+        # from the deployment method env (the same knob the builder and
+        # the MP server's marshal read). Width-0 methods (token drop)
+        # skip entirely — no CUDA touch, no table.
+        from kvtunnel.integration import device_meta
+        from kvtunnel.wire.registry import get_unpacker
+
+        if self._tunnel_unpacker is None:
+            self._tunnel_unpacker = get_unpacker(
+                os.environ.get("KVTUNNEL_MARSHAL_METHOD", "streaming_llm")
+            )
+        if self._tunnel_unpacker.device_meta_width() > 0:
+            device_meta.sync(
+                snapshot,
+                self._tunnel_unpacker,
+                num_blocks=self._vllm_config.cache_config.num_gpu_blocks,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def _build_registry_snapshot(
         self,
@@ -1229,9 +1267,11 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         self._process_cached_requests(scheduler_output, metadata)
 
         # KV tunneling — stage the per-step manifest snapshot onto
-        # ``metadata`` for every in-flight tunneled request (keyed by
-        # first_block_id). The worker rebuilds its registry from this each
-        # step in ``handle_preemptions`` (which runs before the attention
+        # ``metadata`` for every SCHEDULED tunneled request (keyed by
+        # first_block_id; see _stage_tunneled_manifests for the
+        # scheduled-set filter rationale). The worker rebuilds its
+        # registry from this each step in ``handle_preemptions`` (which
+        # runs before the attention
         # builder). The snapshot is the single publish path for both TP=1
         # and TP>1; no scheduler-side write is needed because the manifest
         # is captured at block allocation (``_capture_tunnel_manifest``),
@@ -1313,12 +1353,22 @@ class LMCacheMPConnector(KVConnectorBase_V1):
         ``_capture_tunnel_manifest``. As a fallback this also captures any
         ``scheduled_new_reqs`` entry not already cached.
 
-        Every step: emit the cached ``(manifest, first_block_id)`` for EVERY
-        in-flight tunneled request into ``metadata.tunneled_manifests``
-        (keyed by ``first_block_id``) so the worker's per-step snapshot is
-        complete. The cache — not the request tracker — is the source of
-        truth, so this survives tracker recreation across the async-load
-        transition (see ``__init__``).
+        Every step: emit the cached ``(manifest, first_block_id)`` for
+        every SCHEDULED tunneled request into
+        ``metadata.tunneled_manifests`` (keyed by ``first_block_id``).
+        The cache — not the request tracker — is the source of truth, so
+        this survives tracker recreation across the async-load
+        transition (see ``__init__``); the SCHEDULED-SET FILTER is
+        correctness-critical (device-meta-table design key 1): a
+        preempted request's freed first block can be reallocated to a
+        cold request while the preempted entry lingers in the durable
+        cache — emitting it would key a stale manifest (and a stale
+        device-table row) to an innocent request's block 0. Batch rows
+        are provably a subset of ``num_scheduled_tokens`` (the runner
+        indexes that dict per row), so filtering to it drops only rows
+        that cannot appear in any build; on resume,
+        ``update_state_after_alloc`` refreshes the fbid and the request
+        re-enters scheduled.
         """
         # Fallback first-sight (the primary capture is in
         # ``update_state_after_alloc``). block_ids[0] = first kv-cache
@@ -1331,14 +1381,19 @@ class LMCacheMPConnector(KVConnectorBase_V1):
                 new_req.block_ids[0],
             )
 
-        # Per-step snapshot — emit EVERY in-flight tunneled request's
+        # Per-step snapshot — emit each SCHEDULED tunneled request's
         # manifest, keyed by ``first_block_id`` so the builder can look it
         # up by ``block_table_tensor[req_idx, 0]`` without touching
         # ``input_batch.req_ids``. Driven by the durable cache (pruned only
-        # in ``request_finished``), so the snapshot is correct regardless
-        # of this step's scheduled set or tracker churn.
-        for manifest, first_block_id in self._tunnel_manifests.values():
-            metadata.tunneled_manifests[first_block_id] = manifest
+        # in ``request_finished``) intersected with this step's scheduled
+        # set (see the docstring's stale-fbid rationale).
+        scheduled = scheduler_output.num_scheduled_tokens
+        for request_id, (
+            manifest,
+            first_block_id,
+        ) in self._tunnel_manifests.items():
+            if request_id in scheduled:
+                metadata.tunneled_manifests[first_block_id] = manifest
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
