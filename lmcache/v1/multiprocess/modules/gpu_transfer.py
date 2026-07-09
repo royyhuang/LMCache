@@ -39,6 +39,7 @@ from lmcache.v1.multiprocess.engine_module import (
     ThreadPoolType,
 )
 from lmcache.v1.multiprocess.gpu_context import GPUCacheContext
+from lmcache.v1.multiprocess.marshal_workspace import failure_event_handle
 from lmcache.v1.multiprocess.native_completion import (
     DeviceHostFuncDispatcher,
     submit_callback_to_stream,
@@ -551,10 +552,14 @@ class GPUTransferModule:
                 requests.
             marshal_handle: Rendezvous key for a KV-tunneled request.
                 When non-empty and present in ``ctx.marshal_workspace``,
-                the packed marshalled blob stashed there by a prior MARSHAL
+                the marshalled entry stashed there by a prior MARSHAL
                 RPC is scattered into ``gpu_block_ids`` instead of reading
                 from storage. Empty string (default) falls through to the
-                standard storage path.
+                standard storage path. Non-empty but ABSENT (freed by a
+                racing MARSHAL_FREE, or no workspace published) returns
+                a loud ``(event, False)`` failure — never the stock
+                path, whose tunneled key would trip the chunk-alignment
+                assert and wedge the request.
 
         Returns:
             A tuple where the first element is the IPC handle of the event
@@ -565,19 +570,40 @@ class GPUTransferModule:
             ValueError: If no GPU context is registered for the given instance ID.
         """
         ws = self._ctx.marshal_workspace
-        if marshal_handle and ws is not None and ws.has(marshal_handle):
-            # TP rank comes from the incoming key — each TP worker's
-            # RETRIEVE carries its own worker_id, matching the per-rank
-            # workspace entry produced by marshal(). The empty-handle guard
-            # is FIRST so a non-tunneled RETRIEVE (marshal_handle="") and a
-            # non-GPU server (ws is None) both fall through to the stock
-            # storage path below.
-            return ws.retrieve_into(
-                key.worker_id or 0,
-                gpu_block_ids,
+        if marshal_handle:
+            if ws is not None and ws.has(marshal_handle):
+                # TP rank comes from the incoming key — each TP worker's
+                # RETRIEVE carries its own worker_id, matching the
+                # per-rank workspace entry produced by marshal(). The
+                # empty-handle guard is FIRST so a non-tunneled RETRIEVE
+                # (marshal_handle="") falls through to the stock storage
+                # path below.
+                return ws.retrieve_into(
+                    key.worker_id or 0,
+                    gpu_block_ids,
+                    marshal_handle,
+                    instance_id,
+                )
+            # Late tunneled RETRIEVE: the handle was already freed (an
+            # abort-time MARSHAL_FREE won the race) or no workspace is
+            # published. MUST NOT fall through to the stock path — the
+            # tunneled key's end=num_fake is unaligned for odd chunk
+            # counts, and the session-hash chunk-alignment assert it
+            # would trip gets swallowed by the MQ (no reply -> the
+            # request wedges in WAITING_FOR_REMOTE_KVS). Fail loud.
+            logger.error(
+                "tunneled RETRIEVE for marshal_handle=%s found no "
+                "workspace entry (freed by a racing MARSHAL_FREE, or no "
+                "workspace published); returning failure instead of the "
+                "stock path",
                 marshal_handle,
-                instance_id,
             )
+            entry = self._ctx.gpu_context_registry.get(instance_id)
+            if entry is None:
+                raise ValueError(
+                    f"No GPU context registered for instance ID {instance_id}"
+                )
+            return failure_event_handle(entry.gpu_context), False
 
         st = time.perf_counter()
         obj_keys = self._ctx.resolve_obj_keys(key)

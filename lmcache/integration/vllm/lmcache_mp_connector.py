@@ -542,8 +542,8 @@ class LMCacheMPRequestMetadata:
         kv_params = tracker.kv_transfer_params
         if kv_params and kv_params.get("kv_tunnel_mvp"):
             num_fake = int(kv_params["num_fake"])
-            # num_fake is the packed half-slot count (pack_stored), so it
-            # maps 1:1 to the fake token-slots vLLM allocated; the
+            # num_fake is the packed half-slot count (stored_manifest),
+            # so it maps 1:1 to the fake token-slots vLLM allocated; the
             # RETRIEVE fills exactly num_fake // block_size blocks (= the
             # compress_ratio=2 scatter's k * blocks_per_chunk).
             num_blocks_needed = (num_fake + vllm_block_size - 1) // vllm_block_size

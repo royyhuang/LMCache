@@ -2,11 +2,15 @@
 """KV-tunnel MARSHAL engine module.
 
 The kvtunnel-only half of what used to live in ``GPUTransferModule``:
-the MARSHAL / MARSHAL_FREE / WAIT_STORE handlers. MARSHAL packs an
-already-stored prompt's KV into a pinned workspace blob (via
+the MARSHAL / MARSHAL_FREE / WAIT_STORE handlers. MARSHAL resolves an
+already-stored prompt's KV into a workspace entry (via
 :class:`MarshalWorkspace`, published on ``ctx.marshal_workspace``); a
-later RETRIEVE carrying the same ``marshal_handle`` scatters that blob
-into vLLM's paged cache instead of reading L1. WAIT_STORE gates the
+later RETRIEVE carrying the same ``marshal_handle`` scatters that entry
+into vLLM's paged cache instead of reading L1 by key. Copy-based
+methods (streaming_llm, stub) pack into pinned workspace-pool blobs;
+packed_fp8 is ZERO-COPY — the entry borrows the read-locked L1 chunks
+themselves (stored in wire format at write time) and the RETRIEVE H2Ds
+straight from them (fix/tp1-ttft-overhead). WAIT_STORE gates the
 proxy's next MARSHAL on the previous cycle's STORE committing to L1,
 waiting on ``ctx.chunk_commit_notifier`` (signalled by
 ``GPUTransferModule``'s finish-write callback).
@@ -27,7 +31,7 @@ from kvtunnel.wire.header import (
     TunneledRequestMetadata,
 )
 from kvtunnel.wire.interface import PackRequest
-from kvtunnel.wire.packed_fp8.pack import pack_stored, stored_chunk_views
+from kvtunnel.wire.packed_fp8.pack import stored_chunk_views, stored_manifest
 from kvtunnel.wire.registry import get_packer
 
 # First Party
@@ -60,17 +64,16 @@ logger = init_logger(__name__)
 # never be reworded.
 _L1_MISS_MSG = "unmarshalled KV not fully cached in L1"
 
-# Serialize the pack/emit across MARSHAL handler threads: both the legacy
-# CPU quantize (any non-packed_fp8 method with a heavy pack) and the
-# packed_fp8 stored-read emit (a pinned-pool memcpy) are memory-bandwidth-
-# bound, so running many concurrently only thrashes — the historical
-# CPU-quantize measurement was ~90s at 16-way vs ~1-2s solo, tripping the
-# proxy's 60s marshal timeout and starving the heartbeat ping (MARSHAL
-# shares the NORMAL pool). One-at-a-time keeps each pack at solo speed and
-# the burst drains in N x solo; for packed_fp8's ~ms emit the serialized
-# drain is negligible. RETRIEVE/PING live on other pools, unaffected;
+# Serialize the legacy CPU pack across MARSHAL handler threads: a heavy
+# CPU-quantize pack is memory-bandwidth-bound, so running many
+# concurrently only thrashes — the historical measurement was ~90s at
+# 16-way vs ~1-2s solo, tripping the proxy's 60s marshal timeout and
+# starving the heartbeat ping (MARSHAL shares the NORMAL pool).
+# One-at-a-time keeps each pack at solo speed and the burst drains in
+# N x solo. RETRIEVE/PING live on other pools, unaffected;
 # streaming_llm's window-select pack is sub-ms so the lock stays
-# uncontended.
+# uncontended. packed_fp8 does NOT take it — its zero-copy marshal moves
+# no bytes (fix/tp1-ttft-overhead).
 _PACK_LOCK = threading.Lock()
 
 
@@ -143,12 +146,16 @@ class MarshalModule:
         extra_params: dict,
         worker_id: int,
     ) -> tuple[bool, int, str, dict[int, TunneledRequestMetadata], int]:
-        """Pack ``real_prompt``'s longest cached prefix into a workspace
-        blob for a later RETRIEVE to scatter into vLLM's paged cache.
+        """Resolve ``real_prompt``'s longest cached prefix into a
+        workspace entry for a later RETRIEVE to scatter into vLLM's
+        paged cache.
 
-        StreamingLLM sink + sliding-window selection runs on CPU; the
-        packed chunks are parked in ``ctx.marshal_workspace`` keyed by
-        ``marshal_handle``. The match is the longest chunk-aligned prefix
+        Two regimes: copy-based methods (streaming_llm, stub) pack into
+        pinned workspace-pool blobs (StreamingLLM sink + sliding-window
+        selection on CPU); packed_fp8 is zero-copy — the entry borrows
+        the read-locked L1 chunks themselves. Either way the entry is
+        parked in ``ctx.marshal_workspace`` keyed by ``marshal_handle``.
+        The match is the longest chunk-aligned prefix
         in L1; the hash auto-rounds, so an unaligned ``real_prompt`` is
         accepted and its tail rides the proxy's forwarded suffix. Two
         floors gate every match, each returning a clean cache-miss instead
@@ -175,8 +182,8 @@ class MarshalModule:
 
         Returns:
             ``(success, num_fake, error_message, tunneled_request_per_rank,
-            matched_prefix_len)``. ``num_fake`` is the fake-slot count the
-            blob occupies; ``tunneled_request_per_rank`` maps ``tp_rank``
+            matched_prefix_len)``. ``num_fake`` is the fake-slot count
+            the entry occupies; ``tunneled_request_per_rank`` maps ``tp_rank``
             -> per-layer ``TunneledRequestMetadata``; ``matched_prefix_len``
             is the chunk-aligned count packed (proxy derives the suffix as
             ``real_prompt[matched_prefix_len:]``). On failure all but
@@ -186,13 +193,33 @@ class MarshalModule:
         # allocate() returns ref_count=1; that ref becomes the workspace's
         # only at put(). Until then this fn owns the blobs, so every
         # non-success exit must _free_packed() or leak pinned pool bytes.
+        # (Zero-copy packed_fp8 owns READ LOCKS instead of pool bytes —
+        # see held_keys_per_rank below; _free_packed then only clears.)
         per_rank: dict[int, tuple[list[MemoryObj], TunneledRequestMetadata]] = {}
         published = False
+        # Zero-copy held-keys record: the fetch's post-yield hook appends
+        # each rank's matched keys here instead of releasing their read
+        # locks. Drained EXACTLY ONCE by the function-level finally when
+        # the entry was never published; ownership moves to the
+        # WorkspaceEntry at put(). No in-body code may drain it — the
+        # hook fires AFTER in-body statements (an in-body return resumes
+        # the generator on the way out), so an in-body drain would run
+        # before the current rank was recorded and leak its locks.
+        held_keys_per_rank: dict[int, list[ObjectKey]] = {}
+        # Assigned for real once the method resolves below; False here so
+        # an early raise (e.g. unregistered worker) can run _free_packed
+        # before that line without a NameError.
+        zero_copy = False
 
         def _free_packed() -> None:
-            for objs, _manifest in per_rank.values():
-                for mem_obj in objs:
-                    mem_obj.ref_count_down()
+            # Zero-copy: per_rank holds BORROWED L1 chunks — a
+            # ref_count_down would free live L1 pool bytes through the
+            # refcount-bypassing allocator (their reclamation authority
+            # is the read lock, drained by the finally below).
+            if not zero_copy:
+                for objs, _manifest in per_rank.values():
+                    for mem_obj in objs:
+                        mem_obj.ref_count_down()
             per_rank.clear()
 
         try:
@@ -213,6 +240,11 @@ class MarshalModule:
             # token drop) or ``packed_fp8`` (fp8 2:1 slot-count packing). The
             # stub byte-copy path above is orthogonal to this.
             marshal_method = os.environ.get("KVTUNNEL_MARSHAL_METHOD", "streaming_llm")
+            # Zero-copy marshal: packed_fp8 chunks are stored in wire
+            # format, so the entry borrows the read-locked L1 chunks and
+            # no workspace copy/allocation happens (the stub still
+            # copies — it stamps headers).
+            zero_copy = marshal_method == "packed_fp8" and not use_stub
 
             # Always published in GPU mode (the only mode MARSHAL runs in);
             # the check is for type-narrowing.
@@ -298,6 +330,7 @@ class MarshalModule:
                     cache_salt=cache_salt,
                     marshal_handle=marshal_handle,
                     limit_chunks=limit_chunks,
+                    held_record=held_keys_per_rank if zero_copy else None,
                 ) as fetched:
                     if fetched is None:
                         # No chunk in L1 -> clean miss (proxy passthrough).
@@ -354,25 +387,12 @@ class MarshalModule:
                         # Head geometry validates the chunk's KV_2LTD shape
                         # and fills the header's num_active_heads.
                         shape_desc = gpu_ctx.get_shape_desc(0)
-                        # max_chunks caps the packed-blob chunk count. A
-                        # packing method (packed_fp8) keeps ALL matched tokens,
-                        # so its packed prefix spans far more chunks than
-                        # streaming_llm's small retained window — size to cover
-                        # the full matched prefix (the worst case for any
-                        # method) plus headroom, not just the batch size.
-                        chunk_size = self._ctx.chunk_size
-                        prefix_chunks = (
-                            matched_prefix_len + chunk_size - 1
-                        ) // chunk_size
-                        max_chunks = max(
-                            8, gpu_ctx.max_batch_size * 2, prefix_chunks + 2
-                        )
                         logger.info(
                             "[kvtunnel CB] real-pack tp_rank=%d real_prompt_len=%d "
                             "matched_prefix_len=%d "
                             "chunk_size=%d block_size=%d num_sinks=%d window_size=%d "
                             "num_layers=%d num_kv_heads=%d head_size=%d "
-                            "max_chunks=%d num_groups=%d is_mla=%s",
+                            "num_groups=%d is_mla=%s",
                             tp_rank,
                             len(real_prompt),
                             matched_prefix_len,
@@ -383,34 +403,49 @@ class MarshalModule:
                             gpu_ctx.num_layers,
                             shape_desc.nh,
                             shape_desc.hs,
-                            max_chunks,
                             gpu_ctx.kv_layer_groups_manager.num_groups,
                             gpu_ctx.is_mla,
                         )
                         if marshal_method == "packed_fp8":
-                            # Store-time-packed chunks: no quantize here —
-                            # the packed-READ re-chunks bytes + rebuilds
-                            # the manifest (fixed scale 1.0).
-                            result = self._pack_stored_packed_fp8(
+                            # Zero-copy packed-READ: the chunks were
+                            # packed at write time and stored verbatim —
+                            # nothing to transform. Validate the
+                            # half-slot shape + derive the manifest; the
+                            # entry BORROWS the read-locked L1 chunks
+                            # (no copy, no allocation, no _PACK_LOCK)
+                            # and RETRIEVE H2Ds straight from them.
+                            manifest_or_none = self._stored_views_manifest(
                                 mem_objs=mem_objs,
-                                matched_keys=matched_keys,
-                                workspace_allocator=workspace_allocator,
                                 num_layers=gpu_ctx.num_layers,
                                 hidden=shape_desc.nh * shape_desc.hs,
-                                max_chunks=max_chunks,
                             )
-                            if result is None:
+                            if manifest_or_none is None:
                                 _free_packed()
                                 return (
                                     False,
                                     0,
                                     _L1_MISS_MSG + " (stored-packed chunks"
-                                    " unreadable: scale or shape mismatch)",
+                                    " unreadable: shape mismatch)",
                                     {},
                                     0,
                                 )
-                            packed_list, manifest = result
+                            manifest = manifest_or_none
+                            packed_list = list(mem_objs)
                         else:
+                            # max_chunks caps the copy-based packed-blob
+                            # chunk count — size to cover the full
+                            # matched prefix plus headroom, not just the
+                            # batch size (a method retaining many tokens
+                            # would overflow a batch-sized cap).
+                            chunk_size = self._ctx.chunk_size
+                            prefix_chunks = (
+                                matched_prefix_len + chunk_size - 1
+                            ) // chunk_size
+                            max_chunks = max(
+                                8,
+                                gpu_ctx.max_batch_size * 2,
+                                prefix_chunks + 2,
+                            )
                             # real_prompt_len = matched (not full): anchors
                             # the window and delta so the forwarded suffix
                             # RoPEs at matched_prefix_len..
@@ -433,20 +468,29 @@ class MarshalModule:
                                     req
                                 )
                         num_fake = manifest.per_layer[0].num_fake_marshalled
-                        logger.info(
-                            "[kvtunnel CB] real-pack returned tp_rank=%d "
-                            "num_fake=%d k=%d blob_logical_shape=%s "
-                            "blob_dtype=%s blob_nbytes=%d",
-                            tp_rank,
-                            num_fake,
-                            len(packed_list),
-                            tuple(packed_list[0].meta.shape),
-                            packed_list[0].raw_data.dtype,
-                            sum(mo.get_size() for mo in packed_list),
-                        )
-                    # ref_count=1 from allocate() is the workspace's ref —
-                    # no ref_count_up (would block MARSHAL_FREE). Stored
-                    # before the num_fake check so divergence frees it too.
+                        if not zero_copy:
+                            # Blob-emit log: copy-based packs only (the
+                            # zero-copy path borrows L1 chunks and logs
+                            # its own packed-read line; there is no
+                            # emitted blob to describe).
+                            logger.info(
+                                "[kvtunnel CB] real-pack returned "
+                                "tp_rank=%d num_fake=%d k=%d "
+                                "blob_logical_shape=%s blob_dtype=%s "
+                                "blob_nbytes=%d",
+                                tp_rank,
+                                num_fake,
+                                len(packed_list),
+                                tuple(packed_list[0].meta.shape),
+                                packed_list[0].raw_data.dtype,
+                                sum(mo.get_size() for mo in packed_list),
+                            )
+                    # Copy-based: ref_count=1 from allocate() is the
+                    # workspace's ref — no ref_count_up (would block
+                    # MARSHAL_FREE). Zero-copy: BORROWED L1 chunks (no
+                    # ref taken; the held read locks are the lifetime).
+                    # Stored before the num_fake check so divergence
+                    # frees/releases it too.
                     per_rank[tp_rank] = (packed_list, manifest)
                     tunneled_request_per_rank[tp_rank] = manifest
                     if expected_num_fake < 0:
@@ -467,7 +511,11 @@ class MarshalModule:
                         )
             workspace.put(
                 marshal_handle,
-                WorkspaceEntry(mem_objs_per_rank=per_rank, instance_id=worker_id),
+                WorkspaceEntry(
+                    mem_objs_per_rank=per_rank,
+                    instance_id=worker_id,
+                    l1_keys_per_rank=(held_keys_per_rank if zero_copy else None),
+                ),
             )
             published = True
             logger.info(
@@ -494,40 +542,45 @@ class MarshalModule:
                 # mid-loop raise.
                 _free_packed()
             return (False, 0, str(exc), {}, 0)
+        finally:
+            # Zero-copy lock accounting (single published-guarded drain;
+            # design "Lock-ownership transfer protocol"). Runs AFTER an
+            # in-body miss-return has passed through the fetch's
+            # post-yield hook, so the current rank's keys ARE in the
+            # record; on a raise they never were (the fetch's inner
+            # finally released them). Exactly-once on every exit path.
+            if not published and held_keys_per_rank:
+                self._ctx.storage_manager.finish_read_prefetched(
+                    [key for keys in held_keys_per_rank.values() for key in keys]
+                )
+                held_keys_per_rank.clear()
 
-    def _pack_stored_packed_fp8(
+    def _stored_views_manifest(
         self,
         mem_objs: list[MemoryObj],
-        matched_keys: list[ObjectKey],
-        workspace_allocator,
         num_layers: int,
         hidden: int,
-        max_chunks: int,
-    ) -> tuple[list[MemoryObj], TunneledRequestMetadata] | None:
-        """The packed_fp8 marshal packed-READ, or ``None`` for a clean miss.
+    ) -> TunneledRequestMetadata | None:
+        """The packed_fp8 zero-copy packed-READ, or ``None`` for a miss.
 
         Under packed-at-write the chunks were quantized + slot-packed by
         the WRITE KERNEL (scale fixed 1.0) and stored verbatim as
-        half-slot chunks by the compress_ratio=2 store, so this only
-        validates the packed shape and copies each L1 chunk byte-verbatim
-        into a half-slot workspace chunk (``pack_stored``). ``None``
+        half-slot chunks by the compress_ratio=2 store, so the marshal
+        has nothing to transform: this only validates the packed shape
+        and derives the manifest — the caller borrows the read-locked L1
+        chunks into the workspace entry and the RETRIEVE H2Ds straight
+        from them. No copy, no allocation, no ``_PACK_LOCK``. ``None``
         (clean cache miss -> proxy passthrough, never a 503) when any
-        chunk isn't packed-shaped. ``matched_keys`` is kept for the
-        fetch contract but no longer consulted (the fixed 1.0 scale needs
-        no per-key lookup).
+        chunk isn't packed-shaped.
 
         Args:
             mem_objs: Matched L1 chunks (read-locked by the caller).
-            matched_keys: Their object keys (unused).
-            workspace_allocator: The kvtunnel workspace allocator.
             num_layers: Decoder layer count.
             hidden: ``num_kv_heads * head_size``.
-            max_chunks: Cap on workspace chunks.
 
         Returns:
-            ``(chunks, manifest)`` like ``Packer.pack``, or ``None``.
+            The manifest, or ``None``.
         """
-        del matched_keys  # fetch-contract arg; fixed-1.0 scale needs no key
         views = stored_chunk_views(mem_objs, num_layers, self._ctx.chunk_size, hidden)
         if views is None:
             logger.warning(
@@ -535,24 +588,13 @@ class MarshalModule:
                 "packed-shaped (half-slot) -> miss"
             )
             return None
-        # _PACK_LOCK still serializes the emit: it is a memory-bandwidth-
-        # bound host copy, same contention class as the packs it guards.
-        with _PACK_LOCK:
-            packed_list, manifest = pack_stored(
-                workspace_allocator,
-                views,
-                self._ctx.chunk_size,
-                num_layers,
-                hidden,
-                max_chunks,
-            )
+        manifest = stored_manifest(views, self._ctx.chunk_size, num_layers)
         logger.info(
-            "[kvtunnel CB] packed-read tp-chunks=%d k=%d num_fake=%d",
+            "[kvtunnel CB] packed-read (zero-copy) tp-chunks=%d num_fake=%d",
             len(views),
-            len(packed_list),
             manifest.per_layer[0].num_fake_marshalled,
         )
-        return packed_list, manifest
+        return manifest
 
     @contextmanager
     def _fetch_unmarshalled_for_marshal(
@@ -564,6 +606,7 @@ class MarshalModule:
         *,
         marshal_handle: str,
         limit_chunks: int = 0,
+        held_record: dict[int, list[ObjectKey]] | None = None,
     ) -> Iterator[tuple[list[MemoryObj], list[ObjectKey]] | None]:
         """Context manager: yield ``(chunks, matched_keys)`` for one TP
         rank of ``real_prompt`` while holding their L1 read lock —
@@ -589,6 +632,18 @@ class MarshalModule:
                 The TP two-pass passes the cross-rank min so every rank
                 reads the same length; surplus locks beyond the cap are
                 released before the read.
+            held_record: Keep-locks mode (zero-copy marshal). ``None``
+                (default): the success path releases the read locks
+                after the with-body (the copy made that safe). Non-None:
+                the success path instead TRANSFERS lock ownership by
+                recording ``held_record[tp_rank] = matched_keys`` — the
+                caller (or the workspace entry it publishes) releases
+                them. The hook runs on with-body fall-through AND
+                in-body ``return`` (the return resumes this generator on
+                the way out) but NOT on a with-body raise (the inner
+                ``read_prefetched_results`` finally releases then), so
+                the caller must drain the record exactly once after the
+                with-block — never inside it.
 
         Yields:
             The ordered MemoryObj chunks covering the longest chunk-aligned
@@ -655,17 +710,23 @@ class MarshalModule:
                     )
                     yield None
                     return
-                # marshal()'s with-body copies these bytes into pinned-CPU
-                # tensors (sync CPU slice-assign), so once it returns the
-                # source is fully copied and the lock releases eagerly (no
-                # stream deferral, unlike the async-H2D retrieve path).
                 yield (list(mem_objs), matched_keys)
-                # Reached only if the with-body didn't raise: release the
-                # read lock for exactly the truncated prefix. Success-path
-                # only — read_prefetched_results' finally covers miss/raise.
-                self._ctx.storage_manager.finish_read_prefetched(
-                    matched_keys, extra_count=0
-                )
+                # Reached only if the with-body didn't raise (fall-through
+                # or in-body return) — read_prefetched_results' finally
+                # covers miss/raise.
+                if held_record is not None:
+                    # Keep-locks (zero-copy marshal): transfer ownership
+                    # of exactly the truncated prefix's locks to the
+                    # caller's record instead of releasing.
+                    held_record[tp_rank] = matched_keys
+                else:
+                    # Copy-based methods: the with-body copied the bytes
+                    # into pinned-CPU tensors (sync CPU slice-assign), so
+                    # the lock releases eagerly (no stream deferral,
+                    # unlike the async-H2D retrieve path).
+                    self._ctx.storage_manager.finish_read_prefetched(
+                        matched_keys, extra_count=0
+                    )
 
     @contextmanager
     def _object_keys_for_prompt(
@@ -793,7 +854,9 @@ class MarshalModule:
 
         Fired by the proxy once the request/cycle that consumed the blob
         has finished. Delegates to :meth:`MarshalWorkspace.free` (which
-        owns the pop + stream-ordered ``ref_count_down``); an unknown /
+        owns the pop, plus the stream-ordered ``ref_count_down`` for
+        workspace-owned entries or the unconsumed-rank read-lock release
+        for L1-borrowed ones); an unknown /
         already-freed handle is a no-op there, as is any call when no
         workspace is published (non-GPU server).
 

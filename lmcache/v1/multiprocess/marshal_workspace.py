@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KV-tunnel MARSHAL workspace: blob storage + tunneled-retrieve scatter.
+"""KV-tunnel MARSHAL workspace: entry rendezvous + tunneled-retrieve scatter.
 
 A leaf module owning the per-process MARSHAL -> RETRIEVE rendezvous: the
-pinned workspace pool, the lock, and the ``marshal_handle`` -> blob dict,
-plus the H2D scatter that the tunneled-RETRIEVE path delegates to. Kept as
+pinned workspace pool (copy-based methods), the lock, and the
+``marshal_handle`` -> :class:`WorkspaceEntry` dict (workspace-owned blobs
+OR zero-copy L1-borrowed chunks — see :class:`WorkspaceEntry`), plus the
+H2D scatter that the tunneled-RETRIEVE path delegates to. Kept as
 a leaf (it imports only allocator + pack primitives, never ``modules/`` or
 the ``MPCacheEngineContext`` class) so ``engine_context.py`` can type the
 ``ctx.marshal_workspace`` seam without an import cycle.
@@ -23,16 +25,21 @@ from kvtunnel.wire.header import TunneledRequestMetadata
 from lmcache import torch_dev
 from lmcache.logging import init_logger
 from lmcache.utils import check_interprocess_event_support
+from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.gpu_connector.gpu_ops import lmcache_memcpy_async_h2d
 from lmcache.v1.lazy_memory_allocator import LazyMemoryAllocator
 from lmcache.v1.memory_management import MemoryAllocatorInterface, MemoryObj
+from lmcache.v1.multiprocess.native_completion import (
+    submit_callback_to_stream,
+)
 import lmcache.c_ops as lmc_ops
 
 if TYPE_CHECKING:
-    # Type-only import: keeps this a true leaf so engine_context.py can
+    # Type-only imports: keep this a true leaf so engine_context.py can
     # import MarshalWorkspace at top level (for the ctx.marshal_workspace
     # annotation) without a runtime import cycle. See module docstring.
     from lmcache.v1.multiprocess.engine_context import MPCacheEngineContext
+    from lmcache.v1.multiprocess.gpu_context import GPUCacheContext
 
 logger = init_logger(__name__)
 
@@ -74,29 +81,68 @@ def _batched_iteration(
         yield batch
 
 
+def failure_event_handle(gpu_context: "GPUCacheContext") -> bytes:
+    """A freshly recorded no-op CUDA event's IPC handle.
+
+    The loud-failure reply for tunneled-RETRIEVE paths: the RETRIEVE
+    response contract is ``(event_ipc_handle, success)`` and the worker
+    opens + waits the handle, so a failure must still carry a REAL
+    recorded event (an unrecorded or empty handle would crash or hang
+    the worker). Recorded inside the consuming context's device scope,
+    where stock retrieve creates its events.
+
+    Args:
+        gpu_context: The consuming rank's GPU context (device + stream).
+
+    Returns:
+        The recorded event's IPC handle bytes.
+    """
+    with (
+        torch_dev.device(gpu_context.device),
+        torch_dev.stream(gpu_context.stream),
+    ):
+        check_interprocess_event_support()
+        event = torch_dev.Event(interprocess=True)
+        event.record()
+    return event.ipc_handle()
+
+
 @dataclass
 class WorkspaceEntry:
     """One KV-tunneled MARSHAL blob set, keyed by ``marshal_handle``.
 
-    ``mem_objs_per_rank`` maps tp_rank -> (k pooled chunk MemoryObjs,
-    manifest) — per-rank because each TP worker retrieves its own KV
-    shard (shards hash to different object keys; see
-    ipc_key_to_object_keys). For single-GPU deployments the inner dict
-    has one entry at rank 0. ``instance_id`` is the GPU instance MARSHAL
-    packed against; MARSHAL_FREE schedules the ``ref_count_down`` on that
-    context's stream.
+    ``mem_objs_per_rank`` maps tp_rank -> (k chunk MemoryObjs, manifest)
+    — per-rank because each TP worker retrieves its own KV shard (shards
+    hash to different object keys; see ipc_key_to_object_keys). For
+    single-GPU deployments the inner dict has one entry at rank 0.
+    ``instance_id`` is the GPU instance MARSHAL resolved against.
 
-    Reclaimed by the MARSHAL_FREE RPC the proxy fires when the consuming
-    request/cycle finishes — ``ref_count_down`` returns each chunk to the
-    pinned workspace pool.
+    Two ownership regimes, discriminated by ``l1_keys_per_rank``:
+
+    - ``None`` — workspace-OWNED (streaming_llm, stub): the chunks were
+      allocated from the pinned kvtunnel pool; MARSHAL_FREE reclaims via
+      the stream-ordered ``ref_count_down`` drop on the packing
+      context's stream.
+    - set — L1-BORROWED (packed_fp8 zero-copy): ``mem_objs_per_rank``
+      holds the READ-LOCKED L1 chunks themselves and
+      ``l1_keys_per_rank`` their per-rank object keys. Reclamation means
+      releasing the read locks (``finish_read_prefetched``), NEVER
+      ``ref_count_down`` — that would free live L1 pool bytes through
+      the refcount-bypassing allocator. ``retrieve_into`` consumes a
+      rank by popping BOTH dicts in one ``_lock`` critical section and
+      releases its keys stream-ordered after the H2D; ``free()``
+      releases only the ranks still present (never redeemed).
 
     Args:
-        mem_objs_per_rank: tp_rank -> (packed chunk MemoryObjs, manifest).
-        instance_id: GPU instance the blob was packed against.
+        mem_objs_per_rank: tp_rank -> (chunk MemoryObjs, manifest).
+        instance_id: GPU instance the entry was resolved against.
+        l1_keys_per_rank: tp_rank -> read-locked L1 keys (L1-borrowed
+            entries), or ``None`` (workspace-owned).
     """
 
     mem_objs_per_rank: dict[int, tuple[list[MemoryObj], TunneledRequestMetadata]]
     instance_id: int
+    l1_keys_per_rank: dict[int, list[ObjectKey]] | None = None
 
 
 class MarshalWorkspace:
@@ -135,8 +181,11 @@ class MarshalWorkspace:
         )
         self._lock = threading.Lock()
         # Per-process workspace for KV-tunneled MARSHAL -> RETRIEVE
-        # rendezvous, keyed by marshal_handle. Mutated by put() (write)
-        # and free() (pop), both under ``_lock``; RETRIEVE only reads.
+        # rendezvous, keyed by marshal_handle. The OUTER dict is mutated
+        # only by put() (write) and free() (pop), both under ``_lock`` —
+        # retrieve_into never adds/removes outer entries (it pops rank
+        # state from an ENTRY's inner dicts, also under ``_lock``), so
+        # has()'s lock-free membership read stays safe.
         self._workspace: dict[str, WorkspaceEntry] = {}
         # Device indices on which free() has scheduled a stream-ordered
         # ref_count_down host callback. close() synchronizes exactly these
@@ -156,9 +205,9 @@ class MarshalWorkspace:
         """Return whether ``handle`` has a workspace entry.
 
         Lock-free dict membership: the tunneled-RETRIEVE detection read
-        must stay lock-free (it relies on GIL atomicity, exactly today's
-        RETRIEVE behavior — see the RETRIEVE-only-reads contract on
-        ``_workspace``). Do NOT take ``_lock`` here.
+        must stay lock-free (it relies on GIL atomicity; the OUTER dict
+        is mutated only by put()/free() under ``_lock`` — see the
+        ``_workspace`` comment). Do NOT take ``_lock`` here.
 
         Args:
             handle: The ``marshal_handle`` to test for membership.
@@ -184,19 +233,31 @@ class MarshalWorkspace:
     def free(self, handle: str) -> None:
         """Reclaim the KV-tunnel workspace entry for ``handle``.
 
-        Fired by the proxy once the request/cycle that consumed the blob
-        has finished. Pops the entry under ``_lock``, then schedules the
-        per-chunk ``ref_count_down`` as a stream-ordered host callback on
-        the packing context's stream (the STORE finalize idiom) so a freed
-        chunk's pinned bytes are never reclaimed while an in-flight
-        RETRIEVE H2D is still draining. The normal proxy path fires this
-        only after the vLLM completion returns, i.e. after the H2D has
-        drained, so it is already safe by timing; the stream-ordering is
-        defense for the abort path. The handler does pop + enqueue ONLY —
-        the actual free runs later on the cupy callback thread — so it
-        stays O(us) and never blocks the shared CPU pool. Returns as soon
-        as the free is *enqueued*; the ack does NOT mean the buffer is
-        reclaimed. Unknown / already-freed handle is a no-op.
+        Fired by the proxy once the request/cycle that consumed the
+        entry has finished (or aborted). Pops the entry under ``_lock``,
+        then reclaims by ownership regime:
+
+        - L1-borrowed (zero-copy packed_fp8): release the read locks of
+          ranks NEVER redeemed by a RETRIEVE (abort-before-RETRIEVE) —
+          inline on this handler thread, since no DMA can be in flight
+          for a rank that never redeemed. Consumed ranks were popped and
+          released by their RETRIEVE's stream-ordered callback; the
+          shared ``_lock`` makes the consumed/unconsumed split exact, so
+          double-release is impossible.
+        - Workspace-owned: schedule the per-chunk ``ref_count_down`` as
+          a stream-ordered host callback on the packing context's stream
+          (the STORE finalize idiom) so a freed chunk's pinned bytes are
+          never reclaimed while an in-flight RETRIEVE H2D is still
+          draining. The normal proxy path fires this only after the vLLM
+          completion returns, i.e. after the H2D has drained, so it is
+          already safe by timing; the stream-ordering is defense for the
+          abort path. The handler does pop + enqueue ONLY — the actual
+          free runs later on the cupy callback thread — so it stays
+          O(us) and never blocks the shared CPU pool. Returns as soon as
+          the free is *enqueued*; the ack does NOT mean the buffer is
+          reclaimed.
+
+        Unknown / already-freed handle is a no-op.
 
         Args:
             handle: Workspace entry to reclaim.
@@ -205,6 +266,19 @@ class MarshalWorkspace:
             entry = self._workspace.pop(handle, None)
         if entry is None:
             return  # unknown / already freed — no-op
+
+        if entry.l1_keys_per_rank is not None:
+            # L1-borrowed: NEVER ref_count_down (frees live L1 pool
+            # bytes through the refcount-bypassing allocator); release
+            # the unconsumed ranks' read locks instead.
+            unconsumed = [
+                key for keys in entry.l1_keys_per_rank.values() for key in keys
+            ]
+            if unconsumed:
+                self._ctx.storage_manager.finish_read_prefetched(
+                    unconsumed, extra_count=0
+                )
+            return
 
         all_chunks = [
             mem_obj
@@ -227,6 +301,66 @@ class MarshalWorkspace:
         self._drain_device_indices.add(gpu_entry.gpu_context.device.index)
         gpu_entry.gpu_context.cupy_stream.launch_host_func(_drop, all_chunks)
 
+    def _consume_rank(
+        self, marshal_handle: str, tp_rank: int
+    ) -> tuple[list[MemoryObj], list[ObjectKey] | None, str | None]:
+        """The consume-once critical section: entry lookup + rank pop.
+
+        ONE ``_lock`` acquisition (atomic vs a concurrent :meth:`free`
+        pop) resolves the entry and, for an L1-borrowed one, pops the
+        rank's chunks AND keys from both dicts together — the pop gates
+        the H2D. A workspace-owned entry is a non-consuming ``.get``
+        (duplicate RETRIEVEs re-read the copy).
+
+        Args:
+            marshal_handle: Key into the workspace.
+            tp_rank: The consuming rank.
+
+        Returns:
+            ``(mem_objs, l1_keys, fail)`` — on success ``fail`` is None
+            and ``l1_keys`` carries the popped keys (L1-borrowed) or
+            None (workspace-owned); on failure ``fail`` is the error
+            message and ``l1_keys`` is non-None only in the
+            inconsistent-entry case (keys popped, no blob), which the
+            caller must release inline.
+        """
+        l1_keys: list[ObjectKey] | None = None
+        mem_objs: list[MemoryObj] = []
+        fail: str | None = None
+        with self._lock:
+            entry = self._workspace.get(marshal_handle)
+            if entry is None:
+                fail = (
+                    f"marshal_handle={marshal_handle} not in workspace "
+                    "(freed by a racing MARSHAL_FREE?)"
+                )
+            elif entry.l1_keys_per_rank is None:
+                # Workspace-owned: non-consuming read. Retrieve only
+                # needs the chunks; the manifest flows through the
+                # MARSHAL response to the proxy + connector.
+                pair = entry.mem_objs_per_rank.get(tp_rank)
+                if pair is None:
+                    fail = (
+                        f"marshal_handle={marshal_handle} has no blob for "
+                        f"tp_rank={tp_rank}; available "
+                        f"ranks={sorted(entry.mem_objs_per_rank)}"
+                    )
+                else:
+                    mem_objs, _manifest = pair
+            else:
+                # L1-borrowed: pop BOTH dicts together.
+                pair = entry.mem_objs_per_rank.pop(tp_rank, None)
+                l1_keys = entry.l1_keys_per_rank.pop(tp_rank, None)
+                if pair is None or l1_keys is None:
+                    fail = (
+                        f"marshal_handle={marshal_handle} tp_rank="
+                        f"{tp_rank} already consumed (duplicate "
+                        "RETRIEVE?)"
+                    )
+                else:
+                    mem_objs, _manifest = pair
+        return mem_objs, l1_keys, fail
+
     def retrieve_into(
         self,
         tp_rank: int,
@@ -234,31 +368,42 @@ class MarshalWorkspace:
         marshal_handle: str,
         instance_id: int,
     ) -> tuple[bytes, bool]:
-        """Scatter a workspace blob into vLLM's paged KV cache.
+        """Scatter a workspace entry into vLLM's paged KV cache.
 
-        Scatters the k chunk-sized MemoryObjs the pack emitted, in batches
-        of <= max_batch_size, reusing the same chunk-scatter loop as
-        regular RETRIEVE. The rank's MemoryObjs are read out of the dict
-        under ``_lock`` BEFORE scattering, so a concurrent :meth:`free` of
-        the same handle cannot swap the dict entry mid-read. NOTE: the lock
-        only makes the *dict read* atomic — it does NOT keep the pinned
-        bytes alive. :meth:`free` schedules ``ref_count_down`` on the
-        packing stream; the bytes' lifetime is guaranteed by (a) the
-        proxy's free-after-drain timing (MARSHAL_FREE fires only after the
-        consuming RETRIEVE has drained) and (b) stream-ordering when the
-        scatter is enqueued before free's drop callback — not by this lock.
-        Resolves both ``ctx.chunk_size`` and the owning GPU context (via
-        ``ctx.gpu_context_registry``) internally so the unregistered-id
-        path raises the byte-stable RuntimeError rather than an
-        AttributeError.
+        Scatters the rank's k chunk-sized MemoryObjs in batches of <=
+        max_batch_size, reusing the same chunk-scatter loop as regular
+        RETRIEVE. For a workspace-OWNED entry the chunks are pool copies
+        and the read is non-consuming (bytes' lifetime rests on the
+        proxy's free-after-drain timing + the stream-ordered drop in
+        :meth:`free`). For an L1-BORROWED entry (zero-copy packed_fp8)
+        the H2D reads the read-locked L1 chunks directly, so:
+
+        - CONSUME-ONCE: one ``_lock`` critical section resolves the
+          entry AND pops the rank's ``(mem_objs, keys)`` from both
+          dicts. A missing handle (a racing ``free()`` won) or a missing
+          rank (duplicate RETRIEVE — after the first consume the locks
+          are released and the bytes may already be recycled) is a LOUD
+          failure return, never an H2D.
+        - RELEASE: the popped keys are released stream-ordered on this
+          (consuming) rank's stream via
+          ``submit_callback_to_stream("finish_read_prefetched", ...)`` —
+          the stock-retrieve idiom — submitted in a ``finally`` so a
+          raise inside the H2D/scatter loop still releases after
+          whatever was enqueued. Post-pop failures BEFORE any DMA
+          enqueue release inline instead (one release path per exit).
+        - Every failure exit returns ``(recorded_event, False)`` + an
+          error log, never a raise: the MQ swallows handler raises
+          without replying, the worker future never resolves, and the
+          request wedges in WAITING_FOR_REMOTE_KVS.
 
         Args:
             tp_rank: Which per-rank blob to pick from the workspace entry.
                 Matches the ``worker_id`` on the incoming
                 ``IPCCacheEngineKey`` that STORE originally used.
             gpu_block_ids: Paged-cache block IDs that receive the blob.
-            marshal_handle: Key into the workspace; the caller guarantees
-                it is present (checked lock-free via :meth:`has`).
+            marshal_handle: Key into the workspace; the caller checked
+                membership lock-free via :meth:`has` (may have raced a
+                ``free()`` since — handled here).
             instance_id: GPU instance ID; must have a registered context.
 
         Returns:
@@ -266,29 +411,24 @@ class MarshalWorkspace:
             same shape as regular RETRIEVE.
 
         Raises:
-            RuntimeError: If the requested rank has no blob, the instance
-                is unregistered, or the block count mismatches.
+            RuntimeError: If the instance is unregistered (process-
+                lifetime registration, not a runtime race).
         """
-        # Read the rank's MemoryObjs out of the dict under _lock (atomic vs
-        # a concurrent free() pop/put). The lock guards the dict entry only;
-        # pinned-byte lifetime rests on free-after-drain timing + stream
-        # ordering (see the docstring), not on holding this lock.
-        with self._lock:
-            per_rank = self._workspace[marshal_handle].mem_objs_per_rank
-            if tp_rank not in per_rank:
-                raise RuntimeError(
-                    f"marshal_handle={marshal_handle} has no blob for "
-                    f"tp_rank={tp_rank}; "
-                    f"available ranks={sorted(per_rank.keys())}"
-                )
-            # Workspace stores (chunks, metadata) per-rank. Retrieve only
-            # needs the chunks here; metadata flows through the MARSHAL
-            # response to the proxy + connector.
-            mem_objs, _manifest = per_rank[tp_rank]
-        entry = self._ctx.gpu_context_registry.get(instance_id)
-        if entry is None:
+        # GPU context FIRST: every later failure then records its event
+        # inside this device scope (where stock creates its events).
+        gpu_entry = self._ctx.gpu_context_registry.get(instance_id)
+        if gpu_entry is None:
             raise RuntimeError(f"KV cache not registered for GPU ID {instance_id}")
-        gpu_context = entry.gpu_context
+        gpu_context = gpu_entry.gpu_context
+
+        mem_objs, l1_keys, fail = self._consume_rank(marshal_handle, tp_rank)
+        if fail is not None:
+            if l1_keys:
+                # Inconsistent-entry safety (keys popped, no blob):
+                # release inline — no DMA was or will be enqueued.
+                self._ctx.storage_manager.finish_read_prefetched(l1_keys, extra_count=0)
+            logger.error("[kvtunnel CB] tunneled RETRIEVE failed: %s", fail)
+            return failure_event_handle(gpu_context), False
 
         # Multi-chunk scatter: the pack emits k chunk-sized MemoryObjs.
         # The kernel `multi_layer_block_kv_transfer` hard-asserts
@@ -303,12 +443,21 @@ class MarshalWorkspace:
         blocks_per_chunk = self._ctx.chunk_size // ie_block_size
         expected_block_count = k * blocks_per_chunk
         if len(gpu_block_ids) != expected_block_count:
-            raise RuntimeError(
-                f"gpu_block_ids count mismatch: got {len(gpu_block_ids)}, "
-                f"expected k*blocks_per_chunk = {k}*{blocks_per_chunk} = "
-                f"{expected_block_count} (k chunks x chunk_size / block_size). "
-                f"Check the connector's num_blocks_needed math."
+            if l1_keys:
+                # Post-pop, pre-DMA failure: inline release (outside the
+                # loop-scoped finally — one release path per exit).
+                self._ctx.storage_manager.finish_read_prefetched(l1_keys, extra_count=0)
+            logger.error(
+                "[kvtunnel CB] tunneled RETRIEVE failed: gpu_block_ids "
+                "count mismatch: got %d, expected k*blocks_per_chunk = "
+                "%d*%d = %d (k chunks x chunk_size / block_size). Check "
+                "the connector's num_blocks_needed math.",
+                len(gpu_block_ids),
+                k,
+                blocks_per_chunk,
+                expected_block_count,
             )
+            return failure_event_handle(gpu_context), False
         logger.info(
             "[kvtunnel CB] multi-chunk retrieve handle=%s tp_rank=%d "
             "instance_id=%d k=%d batch_size=%d blocks_per_chunk=%d "
@@ -323,14 +472,22 @@ class MarshalWorkspace:
             (k + batch_size - 1) // batch_size,
         )
 
-        try:
-            with (
-                torch_dev.device(gpu_context.device),
-                torch_dev.stream(gpu_context.stream),
-            ):
+        ok = False
+        # The device-scope entry, support check, and event creation sit
+        # outside the release-guaranteeing try below: a raise here can
+        # only be a process-lifetime configuration failure (bad device /
+        # no IPC-event support) — every retrieve would fail and
+        # ``failure_event_handle`` couldn't build a reply either — not a
+        # runtime race, so the popped keys' TTL backstop is acceptable
+        # (design carve-out: "process-lifetime, not a runtime race").
+        with (
+            torch_dev.device(gpu_context.device),
+            torch_dev.stream(gpu_context.stream),
+        ):
+            check_interprocess_event_support()
+            event = torch_dev.Event(interprocess=True)
+            try:
                 all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
-                check_interprocess_event_support()
-                event = torch_dev.Event(interprocess=True)
                 num_groups = gpu_context.kv_layer_groups_manager.num_groups
 
                 # Outer loop: iterate batches of <= batch_size chunks. Each
@@ -380,28 +537,42 @@ class MarshalWorkspace:
                             0,
                         )
 
+                ok = True
+            except Exception:
+                # Loud, never re-raised: a raise in a RETRIEVE handler
+                # is swallowed by the MQ without a reply and the
+                # request wedges in WAITING_FOR_REMOTE_KVS.
+                logger.exception(
+                    "[kvtunnel CB] retrieve_from_workspace raised "
+                    "handle=%s tp_rank=%d k=%d num_blocks=%d",
+                    marshal_handle,
+                    tp_rank,
+                    k,
+                    len(gpu_block_ids),
+                )
+            finally:
                 event.record()
-        except Exception:
-            # Surface the exception explicitly so it's grep-able in the
-            # MP log before mq._notify_response swallows the response.
-            logger.exception(
-                "[kvtunnel CB] retrieve_from_workspace raised handle=%s "
-                "tp_rank=%d k=%d num_blocks=%d",
+                if l1_keys:
+                    # Consumed-rank release: stream-ordered on THIS
+                    # (consuming) rank's stream, after whatever was
+                    # enqueued — the stock-retrieve idiom
+                    # (gpu_transfer.py finish_read_prefetched callback).
+                    # In a finally so a raise mid-loop still releases.
+                    submit_callback_to_stream(
+                        gpu_context.cupy_stream,
+                        "finish_read_prefetched",
+                        l1_keys,
+                    )
+        ipc_bytes = event.ipc_handle()
+        if ok:
+            logger.info(
+                "RETRIEVE from workspace handle=%s k=%d blocks=%d "
+                "(returning ipc_handle, success)",
                 marshal_handle,
-                tp_rank,
                 k,
                 len(gpu_block_ids),
             )
-            raise
-        ipc_bytes = event.ipc_handle()
-        logger.info(
-            "RETRIEVE from workspace handle=%s k=%d blocks=%d "
-            "(returning ipc_handle, success)",
-            marshal_handle,
-            k,
-            len(gpu_block_ids),
-        )
-        return ipc_bytes, True
+        return ipc_bytes, ok
 
     def close(self) -> None:
         """Drain in-flight MARSHAL_FREE callbacks, then free the pool.

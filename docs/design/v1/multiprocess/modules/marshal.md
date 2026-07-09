@@ -37,12 +37,19 @@ A leaf module (imports only the allocator + pack primitives, never `modules/`
 or the `MPCacheEngineContext` class), so `engine_context.py` can type the
 `ctx.marshal_workspace` seam without an import cycle. Owns: the dedicated
 pinned `LazyMemoryAllocator` (separate from the L1 allocator), the `_workspace`
-dict (`put`/`free` under `_lock`, `has`/ `retrieve_into` read), and
-`_drain_device_indices`.
+dict (outer dict mutated by `put`/`free` under `_lock`; `has` reads lock-free;
+`retrieve_into` pops rank state from an entry's inner dicts under `_lock`),
+and `_drain_device_indices`.
 
-`free` pops the entry and schedules each chunk's `ref_count_down` as a
-stream-ordered host callback via `cupy_stream.launch_host_func`, recording the
-packing context's device index in `_drain_device_indices`.
+Two entry ownership regimes (fix/tp1-ttft-overhead): workspace-OWNED entries
+(copy-based methods) hold pool blobs — `free` pops the entry and schedules
+each chunk's `ref_count_down` as a stream-ordered host callback via
+`cupy_stream.launch_host_func`, recording the packing context's device index
+in `_drain_device_indices`. L1-BORROWED entries (packed_fp8 zero-copy) hold
+the read-locked L1 chunks themselves — `retrieve_into` consumes a rank
+(popping chunks + keys together) and releases its read locks stream-ordered
+on the consuming rank's stream; `free` releases only never-redeemed ranks'
+locks inline, and NEVER `ref_count_down`s borrowed chunks.
 
 ## Close ordering + the multi-device drain
 

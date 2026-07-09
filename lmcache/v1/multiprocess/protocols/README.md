@@ -210,8 +210,10 @@ Testing and monitoring:
 ### MARSHAL Operations (`marshal.py`)
 KV-tunnel pack/scatter rendezvous (kvtunnel fork addition; handled by
 `MarshalModule`, not `GPUTransferModule`):
-- `MARSHAL`: Pack an already-stored prompt's KV into a workspace blob
-- `MARSHAL_FREE`: Reclaim a workspace blob once its RETRIEVE has drained
+- `MARSHAL`: Resolve an already-stored prompt's KV into a workspace entry
+  (copy-based methods pack a pool blob; packed_fp8 zero-copy borrows the
+  read-locked L1 chunks)
+- `MARSHAL_FREE`: Reclaim a workspace entry once its RETRIEVE has drained
 - `WAIT_STORE`: Block until the source prompt's STORE has committed to L1
 
 ## Handler Types
