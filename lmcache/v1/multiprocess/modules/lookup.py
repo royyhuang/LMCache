@@ -174,6 +174,7 @@ class LookupModule:
             key: Cache key with request_id embedded.
             tp_size: Tensor-parallel size for MLA multi-reader locking.
         """
+        _t_lookup = time.perf_counter()
         model_name, world_size = key.model_name, key.world_size
         self._ctx.event_bus.publish(
             Event(
@@ -283,6 +284,17 @@ class LookupModule:
                 model_name=model_name,
                 cache_salt=key.cache_salt,
             )
+        )
+        # TTFT wave-trace diagnosis (kvtunnel fix/tp1-ttft-overhead):
+        # server-side LOOKUP service time + hit count, one line per
+        # request, so the vLLM-side submission gap can be decomposed
+        # into lookup-service vs scheduler-retry time.
+        logger.info(
+            "LOOKUP resolved request_id=%s hits=%d/%d in %.1f ms",
+            key.request_id,
+            handle.l1_prefix_hit_count,
+            len(obj_keys),
+            (time.perf_counter() - _t_lookup) * 1000.0,
         )
 
     def query_prefetch_lookup_hits(
